@@ -1,9 +1,11 @@
 //! State aplikasi dan penanganan tombol. Tidak ada I/O di sini kecuali lewat `Client`.
 
+use chrono::Datelike;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 
 use crate::api::{Client, Module};
+use crate::cache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -26,6 +28,12 @@ pub struct App {
     pub page: u32,
     pub search: String,
     pub searching: bool,
+    /// Tahun anggaran aktif. Default tahun berjalan.
+    pub year: i32,
+    /// Indeks dropdown tahun yang sedang terbuka.
+    pub year_menu: Option<usize>,
+    /// Data yang tampil berasal dari cache, dengan waktu simpan (Unix detik).
+    pub cached_at: Option<i64>,
     pub rows: Vec<Value>,
     pub selected: usize,
     pub detail: Option<Value>,
@@ -46,6 +54,9 @@ impl App {
             page: 1,
             search: String::new(),
             searching: false,
+            year: chrono::Local::now().year(),
+            year_menu: None,
+            cached_at: None,
             rows: Vec::new(),
             selected: 0,
             detail: None,
@@ -133,12 +144,26 @@ impl App {
 
     /// Muat halaman daftar aktif. Error ditampilkan di status bar, layar tetap.
     pub fn load(&mut self) {
-        match self.client.list(self.module, self.page, &self.search) {
+        match self.client.list(self.module, self.page, &self.search, self.year) {
             Ok(rows) => {
+                cache::save(self.module, self.year, self.page, &self.search, &rows);
+                self.cached_at = None;
                 self.status = format!("{} baris di halaman {}.", rows.len(), self.page);
                 self.rows = rows;
-                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
             }
+            // Status 0 = tidak ada koneksi. Tampilkan cache terakhir bila ada.
+            Err(e) if e.status == 0 => match cache::load(self.module, self.year, self.page, &self.search) {
+                Some((rows, saved_at)) => {
+                    self.status = format!("Offline. Data dari cache tersimpan {}.", cache::format_time(saved_at));
+                    self.cached_at = Some(saved_at);
+                    self.rows = rows;
+                }
+                None => {
+                    self.rows.clear();
+                    self.cached_at = None;
+                    self.status = "Offline dan belum ada cache untuk daftar ini.".to_string();
+                }
+            },
             Err(e) => {
                 self.status = format!("Gagal memuat daftar: {e}");
                 if e.status == 401 {
@@ -147,9 +172,34 @@ impl App {
                 }
             }
         }
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn key_year_menu(&mut self, code: KeyCode) {
+        let options = cache::year_options(chrono::Local::now().year());
+        let Some(idx) = self.year_menu else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.year_menu = None,
+            KeyCode::Up => self.year_menu = Some(idx.saturating_sub(1)),
+            KeyCode::Down => self.year_menu = Some((idx + 1).min(options.len() - 1)),
+            KeyCode::Enter => {
+                self.year = options[idx];
+                self.year_menu = None;
+                self.page = 1;
+                self.selected = 0;
+                self.load();
+            }
+            _ => {}
+        }
     }
 
     fn key_list(&mut self, code: KeyCode) {
+        if self.year_menu.is_some() {
+            self.key_year_menu(code);
+            return;
+        }
         if self.searching {
             match code {
                 KeyCode::Esc => self.searching = false,
@@ -193,6 +243,10 @@ impl App {
                 self.searching = true;
             }
             KeyCode::Char('r') => self.load(),
+            KeyCode::Char('t') => {
+                let options = cache::year_options(chrono::Local::now().year());
+                self.year_menu = options.iter().position(|y| *y == self.year).or(Some(0));
+            }
             KeyCode::Enter => self.open_detail(),
             _ => {}
         }
