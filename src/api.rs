@@ -37,6 +37,14 @@ impl Module {
         }
     }
 
+    /// Nama parameter filter tahun anggaran di API. Pekerjaan memfilter lewat kegiatan induknya.
+    pub fn year_param(self) -> &'static str {
+        match self {
+            Module::DocumentRegister => "year",
+            Module::Pekerjaan | Module::Kontrak => "tahun",
+        }
+    }
+
     /// Kunci yang dipakai untuk judul baris, dicoba berurutan. Field lain tetap tampil di detail.
     pub fn label_keys(self) -> &'static [&'static str] {
         match self {
@@ -139,10 +147,11 @@ impl Client {
         check(resp).map(|_| ())
     }
 
-    pub fn list(&self, m: Module, page: u32, search: &str) -> Result<Vec<Value>, ApiError> {
+    pub fn list(&self, m: Module, page: u32, search: &str, year: i32) -> Result<Vec<Value>, ApiError> {
         let mut req = self
             .auth(self.http.get(format!("{}/{}", self.base, m.path())))?
-            .query(&[("page", page.to_string()), ("per_page", PER_PAGE.to_string())]);
+            .query(&[("page", page.to_string()), ("per_page", PER_PAGE.to_string())])
+            .query(&[(m.year_param(), year.to_string())]);
         if !search.trim().is_empty() {
             req = req.query(&[("search", search.trim())]);
         }
@@ -265,11 +274,11 @@ mod tests {
         let password = std::env::var("APIAMIS_TEST_PASSWORD").expect("APIAMIS_TEST_PASSWORD");
         let mut c = Client::new(base).unwrap();
 
-        assert!(c.list(Module::Pekerjaan, 1, "").is_err(), "sebelum login harus ditolak");
+        assert!(c.list(Module::Pekerjaan, 1, "", 2026).is_err(), "sebelum login harus ditolak");
         c.login(&email, &password).expect("login");
 
         for m in Module::ALL {
-            let rows = c.list(m, 1, "").unwrap_or_else(|e| panic!("list {}: {e}", m.title()));
+            let rows = c.list(m, 1, "", 2026).unwrap_or_else(|e| panic!("list {}: {e}", m.title()));
             println!("{}: {} baris", m.title(), rows.len());
             if let Some(id) = rows.first().and_then(|r| r.get("id")).and_then(Value::as_u64) {
                 let d = c.detail(m, id).unwrap_or_else(|e| panic!("detail {}: {e}", m.title()));
@@ -278,6 +287,6 @@ mod tests {
         }
 
         c.logout().expect("logout");
-        assert!(c.list(Module::Pekerjaan, 1, "").is_err(), "setelah logout harus ditolak");
+        assert!(c.list(Module::Pekerjaan, 1, "", 2026).is_err(), "setelah logout harus ditolak");
     }
 }

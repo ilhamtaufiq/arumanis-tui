@@ -4,9 +4,11 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+
+use chrono::Datelike;
 
 use crate::api::Module;
 use crate::app::{scalar_text, App, Screen};
@@ -55,7 +57,8 @@ fn help_line(app: &App) -> &'static str {
         Screen::Login => "Tab ganti kolom · Enter masuk · Esc keluar",
         Screen::Menu => "↑/↓ pilih · Enter buka · l keluar · q keluar aplikasi",
         Screen::List if app.searching => "Ketik kata kunci · Enter cari · Esc batal",
-        Screen::List => "↑/↓ pilih · Enter detail · / cari · ←/→ halaman · r muat ulang · Esc kembali",
+        Screen::List if app.year_menu.is_some() => "↑/↓ pilih tahun · Enter terapkan · Esc batal",
+        Screen::List => "↑/↓ pilih · Enter detail · / cari · t tahun · ←/→ halaman · r muat ulang · Esc kembali",
         Screen::Detail => "Esc atau Backspace kembali",
     }
 }
@@ -105,8 +108,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("cari: {}", app.search)
     };
+    let title = if app.cached_at.is_some() {
+        format!(" Tahun {} · halaman {} · offline ", app.year, app.page)
+    } else {
+        format!(" Tahun {} · halaman {} ", app.year, app.page)
+    };
     frame.render_widget(
-        Paragraph::new(search_text).block(Block::bordered().title(format!(" Halaman {} ", app.page))),
+        Paragraph::new(search_text).block(Block::bordered().title(title)),
         search_area,
     );
 
@@ -122,6 +130,26 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let selected = if app.rows.is_empty() { None } else { Some(app.selected) };
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(list, rows_area, &mut state);
+
+    if let Some(idx) = app.year_menu {
+        draw_year_menu(frame, rows_area, idx);
+    }
+}
+
+/// Dropdown tahun anggaran, digambar di atas daftar.
+fn draw_year_menu(frame: &mut Frame, area: Rect, idx: usize) {
+    let options = crate::cache::year_options(chrono::Local::now().year());
+    let width = 16u16.min(area.width);
+    let height = (options.len() as u16 + 2).min(area.height);
+    let popup = Rect::new(area.x + area.width.saturating_sub(width), area.y, width, height);
+    let items: Vec<ListItem> = options.iter().map(|y| ListItem::new(y.to_string())).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(" Tahun "))
+        .highlight_style(Style::default().bg(ACCENT).fg(Color::White))
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default().with_selected(Some(idx));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
