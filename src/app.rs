@@ -8,6 +8,7 @@ use crate::api::{Client, Module};
 use crate::cache;
 use crate::form::{self, Form, Kind};
 use crate::queue::{self, Pending};
+use crate::session::{self, Galat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -124,16 +125,60 @@ impl App {
         }
         let email = self.email.trim().to_string();
         let password = self.password.clone();
+        let sekarang = chrono::Utc::now().timestamp();
         match self.client.login(&email, &password) {
             Ok(()) => {
+                // Simpan sesi terenkripsi agar bisa dibuka offline. Gagal menyimpan tidak menggagalkan login.
+                let simpan = match self.client.token() {
+                    Some(token) => session::simpan(&email, &password, token, sekarang),
+                    None => Ok(()),
+                };
                 self.password.clear();
                 self.screen = Screen::Menu;
                 self.menu_idx = 0;
-                self.status = format!("Masuk sebagai {email}.");
+                self.status = match simpan {
+                    Ok(()) => format!("Masuk sebagai {email}."),
+                    Err(err) => {
+                        format!("Masuk sebagai {email}, tapi sesi offline gagal disimpan: {err:?}")
+                    }
+                };
                 if !self.antrean.is_empty() {
                     self.sinkron();
                 }
             }
+            // Status 0 = tidak ada koneksi: coba sesi offline yang tersimpan di perangkat ini.
+            Err(e) if e.status == 0 => match session::buka(&email, &password, sekarang) {
+                Ok(sesi) => {
+                    self.client.pakai_token(sesi.token);
+                    self.password.clear();
+                    self.screen = Screen::Menu;
+                    self.menu_idx = 0;
+                    self.status = format!(
+                        "Masuk offline sebagai {email}. Sesi berlaku sampai {}. Data dari cache; perubahan masuk antrean.",
+                        cache::format_time(sesi.berakhir)
+                    );
+                }
+                Err(Galat::PasswordSalah) => {
+                    self.status =
+                        "Tidak ada koneksi, dan password tidak cocok dengan sesi di perangkat ini."
+                            .to_string();
+                }
+                Err(Galat::AkunBeda) => {
+                    self.status = "Tidak ada koneksi. Perangkat ini menyimpan sesi akun lain; hubungkan ke internet untuk masuk.".to_string();
+                }
+                Err(Galat::Kedaluwarsa) => {
+                    self.status =
+                        "Sesi offline sudah kedaluwarsa. Hubungkan ke internet untuk masuk."
+                            .to_string();
+                }
+                Err(Galat::Kosong) => {
+                    self.status =
+                        "Tidak ada koneksi, dan belum pernah masuk di perangkat ini.".to_string();
+                }
+                Err(Galat::Io(m)) => {
+                    self.status = format!("Tidak ada koneksi, dan sesi offline gagal dibaca: {m}");
+                }
+            },
             Err(e) => self.status = format!("Login gagal: {e}"),
         }
     }
@@ -273,6 +318,8 @@ impl App {
                     self.load();
                 }
             }
+            KeyCode::Tab => self.ganti_modul(1),
+            KeyCode::BackTab => self.ganti_modul(-1),
             KeyCode::Char('/') => {
                 self.searching = true;
             }
@@ -292,6 +339,20 @@ impl App {
             KeyCode::Enter => self.open_detail(),
             _ => {}
         }
+    }
+
+    /// Pindah ke modul sebelah (`delta` = 1) atau sebelumnya (-1) lewat tab di daftar.
+    fn ganti_modul(&mut self, delta: isize) {
+        let n = Module::ALL.len() as isize;
+        let idx = Module::ALL
+            .iter()
+            .position(|m| *m == self.module)
+            .unwrap_or(0) as isize;
+        self.module = Module::ALL[(idx + delta).rem_euclid(n) as usize];
+        self.page = 1;
+        self.search.clear();
+        self.selected = 0;
+        self.load();
     }
 
     fn open_detail(&mut self) {
@@ -351,6 +412,8 @@ impl App {
 
     /// Mencabut token di server, lalu kembali ke layar login.
     fn logout(&mut self) {
+        // Sesi offline ikut dihapus: keluar berarti perangkat ini tidak lagi menyimpan token.
+        session::hapus();
         let result = self.client.logout();
         self.rows.clear();
         self.detail = None;
@@ -766,24 +829,6 @@ impl App {
     fn baru_id(&self) -> u64 {
         chrono::Utc::now().timestamp_millis().max(0) as u64 + self.antrean.len() as u64
     }
-
-    /// Label singkat sebuah baris untuk daftar, dari kunci yang tersedia.
-    pub fn row_label(&self, row: &Value) -> String {
-        let parts: Vec<String> = self
-            .module
-            .label_keys()
-            .iter()
-            .filter_map(|k| row.get(*k))
-            .filter_map(scalar_text)
-            .filter(|s| !s.is_empty())
-            .take(2)
-            .collect();
-        if parts.is_empty() {
-            format!("#{}", row.get("id").and_then(Value::as_u64).unwrap_or(0))
-        } else {
-            parts.join(" · ")
-        }
-    }
 }
 
 fn hari_ini() -> String {
@@ -897,16 +942,6 @@ mod tests {
 
     fn app() -> App {
         App::new(Client::new(DEFAULT_BASE.to_string()).unwrap())
-    }
-
-    #[test]
-    fn label_memakai_kunci_pertama_yang_ada() {
-        let mut a = app();
-        a.module = Module::Kontrak;
-        let row = json!({ "id": 7, "spk": "SPK-1", "kode_paket": "K-9" });
-        assert_eq!(a.row_label(&row), "SPK-1 · K-9");
-        let kosong = json!({ "id": 7 });
-        assert_eq!(a.row_label(&kosong), "#7");
     }
 
     #[test]

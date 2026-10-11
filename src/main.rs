@@ -3,6 +3,7 @@ mod app;
 mod cache;
 mod form;
 mod queue;
+mod session;
 mod ui;
 
 use std::time::Duration;

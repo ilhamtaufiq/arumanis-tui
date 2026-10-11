@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Tabs, Wrap,
+    },
     Frame,
 };
 
@@ -269,8 +272,27 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
-    let [cari_area, rows_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    let [tab_area, cari_area, rows_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+
+    let pilih = Module::ALL
+        .iter()
+        .position(|m| *m == app.module)
+        .unwrap_or(0);
+    let tabs = Tabs::new(Module::ALL.iter().map(|m| m.title()))
+        .select(pilih)
+        .style(Style::default().fg(MUTED))
+        .highlight_style(
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider("  ");
+    frame.render_widget(tabs, tab_area);
 
     let teks_cari = if app.searching {
         Line::from(vec![
@@ -303,44 +325,185 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(teks_cari).block(panel(&judul)), cari_area);
 
-    let mut items: Vec<ListItem> = antrean
+    let (headers, widths) = kolom_modul(app.module);
+    let rows_total = antrean.len() + app.rows.len().max(1);
+    let mut rows: Vec<Row> = antrean
         .iter()
-        .map(|p| match &p.galat {
-            Some(g) => ListItem::new(Line::from(vec![
-                Span::styled("✖ ", Style::default().fg(ERR)),
-                Span::raw(format!("{}  ", p.label)),
-                Span::styled(format!("ditolak: {g}"), Style::default().fg(ERR)),
-            ])),
-            None => ListItem::new(Line::from(vec![
-                Span::styled("⧗ ", Style::default().fg(WARN)),
-                Span::raw(format!("{}  ", p.label)),
-                Span::styled("menunggu kirim", Style::default().fg(WARN)),
-            ])),
+        .map(|p| {
+            let (ikon, warna, status) = match &p.galat {
+                Some(g) => ("✖", ERR, format!("ditolak: {g}")),
+                None => ("⧗", WARN, "menunggu kirim".to_string()),
+            };
+            let mut cells: Vec<Cell> = vec![Cell::from(format!("{ikon} {}", p.label))];
+            cells.extend(std::iter::repeat_with(|| Cell::from("")).take(headers.len() - 2));
+            cells.push(Cell::from(status));
+            Row::new(cells).style(Style::default().fg(warna))
         })
         .collect();
-    let offset = items.len();
+    let offset = rows.len();
     if app.rows.is_empty() {
-        items.push(ListItem::new(Span::styled(
+        rows.push(Row::new(vec![Cell::from(Span::styled(
             "Tidak ada data di halaman ini.",
             Style::default().fg(MUTED),
-        )));
+        ))]));
     } else {
-        items.extend(app.rows.iter().map(|r| ListItem::new(app.row_label(r))));
+        rows.extend(app.rows.iter().map(|r| Row::new(sel_kolom(app.module, r))));
     }
-    let list = List::new(items)
+    let header = Row::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let table = Table::new(rows, widths)
+        .header(header)
         .block(panel("Daftar"))
-        .highlight_style(sorot())
-        .highlight_symbol("▶ ");
+        .row_highlight_style(sorot())
+        .highlight_symbol("▶ ")
+        .column_spacing(2);
     let selected = if app.rows.is_empty() {
         None
     } else {
         Some(offset + app.selected)
     };
-    let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(list, rows_area, &mut state);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, rows_area, &mut state);
+    render_scrollbar(frame, rows_area, rows_total, selected.unwrap_or(0));
 
     if let Some(idx) = app.year_menu {
         draw_year_menu(frame, rows_area, idx);
+    }
+}
+
+/// Judul dan lebar kolom daftar per modul.
+fn kolom_modul(m: Module) -> (Vec<&'static str>, Vec<Constraint>) {
+    match m {
+        Module::Pekerjaan => (
+            vec!["Nama paket", "Kode rekening", "Pagu", "Status"],
+            vec![
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(16),
+                Constraint::Length(16),
+            ],
+        ),
+        Module::Kontrak => (
+            vec!["Pekerjaan", "SPK", "Kode paket", "Nilai kontrak", "Tgl SPK"],
+            vec![
+                Constraint::Min(24),
+                Constraint::Length(14),
+                Constraint::Length(12),
+                Constraint::Length(16),
+                Constraint::Length(12),
+            ],
+        ),
+        Module::DocumentRegister => (
+            vec!["Nama paket", "Kode rekening", "Kontrak", "Register"],
+            vec![
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        ),
+    }
+}
+
+/// Sel untuk satu baris data, sesuai kolom modul.
+fn sel_kolom(m: Module, row: &serde_json::Value) -> Vec<Cell<'static>> {
+    let teks = |k: &str| {
+        row.get(k)
+            .and_then(crate::app::scalar_text)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let tanggal = |k: &str| teks(k).chars().take(10).collect::<String>();
+    let jumlah_kontrak = row
+        .get("kontrak")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let jumlah_register: usize = row
+        .get("kontrak")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |ks| {
+            ks.iter()
+                .map(|k| {
+                    k.get("registers")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len)
+                })
+                .sum()
+        });
+    match m {
+        Module::Pekerjaan => vec![
+            Cell::from(teks("nama_paket")),
+            Cell::from(teks("kode_rekening")),
+            Cell::from(rupiah(row.get("pagu"))).style(Style::default().fg(Color::White)),
+            Cell::from(status_teks(&teks("status"))),
+        ],
+        Module::Kontrak => vec![
+            Cell::from(pekerjaan_kontrak(row)),
+            Cell::from(teks("spk")),
+            Cell::from(teks("kode_paket")),
+            Cell::from(rupiah(row.get("nilai_kontrak"))),
+            Cell::from(tanggal("tgl_spk")),
+        ],
+        Module::DocumentRegister => vec![
+            Cell::from(teks("nama_paket")),
+            Cell::from(teks("kode_rekening")),
+            Cell::from(jumlah_kontrak.to_string()),
+            Cell::from(Span::styled(
+                format!("{jumlah_register} nomor"),
+                Style::default().fg(if jumlah_register > 0 { OK } else { MUTED }),
+            )),
+        ],
+    }
+}
+
+/// Nama pekerjaan pada kontrak: paket pertama, dengan `+N` bila ada paket lain (konsolidasi).
+fn pekerjaan_kontrak(row: &serde_json::Value) -> String {
+    let daftar = row
+        .get("pekerjaans")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let Some(pertama) = daftar
+        .first()
+        .and_then(|p| p.get("nama_paket"))
+        .and_then(crate::app::scalar_text)
+    else {
+        return "-".to_string();
+    };
+    if daftar.len() > 1 {
+        format!("{pertama} (+{})", daftar.len() - 1)
+    } else {
+        pertama
+    }
+}
+
+fn status_teks(s: &str) -> String {
+    match s {
+        "active" => "aktif".to_string(),
+        "canceled" => "batal".to_string(),
+        "-" => "-".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Angka sebagai rupiah dengan pemisah ribuan titik, mis. `1.500.000`. `-` bila kosong.
+fn rupiah(v: Option<&serde_json::Value>) -> String {
+    let n = v.and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()));
+    let Some(n) = n else {
+        return "-".to_string();
+    };
+    let angka = format!("{:.0}", n.abs());
+    let mut out = String::new();
+    for (i, c) in angka.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    let out: String = out.chars().rev().collect();
+    if n < 0.0 {
+        format!("-{out}")
+    } else {
+        out
     }
 }
 
@@ -414,7 +577,24 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 const NAMA_W: usize = 30;
 const NOMOR_W: usize = 24;
 
-/// Detail register: header pekerjaan dan kontrak, lalu satu baris per jenis dokumen.
+/// Scrollbar vertikal di tepi kanan area. Dilewati bila tidak ada yang bisa digulir.
+fn render_scrollbar(frame: &mut Frame, area: Rect, total: usize, posisi: usize) {
+    if total <= 1 || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(total - 1).position(posisi);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(Style::default().fg(ACCENT_SOFT))
+            .track_style(Style::default().fg(MUTED)),
+        area.inner(Margin::new(0, 1)),
+        &mut state,
+    );
+}
+
+/// Detail register: header pekerjaan dan kontrak, progres nomor, lalu tabel jenis dokumen.
 /// Baris yang disorot adalah jenis yang dipilih. Enter mengisi atau mengubah nomornya.
 fn draw_detail_register(frame: &mut Frame, app: &App, value: &serde_json::Value, area: Rect) {
     let teks = |k: &str| {
@@ -439,13 +619,24 @@ fn draw_detail_register(frame: &mut Frame, app: &App, value: &serde_json::Value,
         .and_then(crate::app::scalar_text)
         .unwrap_or_else(|| "-".to_string());
 
+    let blok = panel("Register");
+    let dalam = blok.inner(area);
+    frame.render_widget(blok, area);
+    let [header, progres, _, tabel_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(dalam);
+
     let label = |t: &str| {
         Span::styled(
             format!("{t:<12}"),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )
     };
-    let mut lines: Vec<Line> = vec![
+    let baris_header = vec![
         Line::from(vec![
             label("Pekerjaan"),
             Span::styled(
@@ -458,68 +649,94 @@ fn draw_detail_register(frame: &mut Frame, app: &App, value: &serde_json::Value,
         Line::from(vec![label("Kode rek."), Span::raw(teks("kode_rekening"))]),
         Line::from(vec![label("Kontrak"), Span::raw(spk)]),
         Line::from(vec![label("Penyedia"), Span::raw(penyedia)]),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                "  {:<NAMA_W$}{:<NOMOR_W$}{}",
-                "Jenis dokumen", "Nomor", "Tanggal"
-            ),
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        )),
     ];
+    frame.render_widget(Paragraph::new(baris_header), header);
 
-    if app.jenis.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Jenis dokumen belum dimuat.",
-            Style::default().fg(WARN),
-        )));
-    }
-    for (i, j) in app.jenis.iter().enumerate() {
-        let nama = format!(
-            "{} ({})",
-            j.get("name")
-                .and_then(crate::app::scalar_text)
-                .unwrap_or_default(),
-            j.get("code")
-                .and_then(crate::app::scalar_text)
-                .unwrap_or_default()
-        );
-        let type_id = j.get("id").and_then(serde_json::Value::as_u64);
-        let reg = type_id.and_then(|t| register_untuk_jenis(value, t));
-        let (nomor, tanggal, nomor_gaya) = match &reg {
-            Some(r) => (
-                r.get("nomor")
-                    .and_then(crate::app::scalar_text)
-                    .unwrap_or_else(|| "-".to_string()),
-                r.get("tanggal")
-                    .and_then(crate::app::scalar_text)
-                    .map(|t| t.chars().take(10).collect::<String>())
-                    .unwrap_or_else(|| "-".to_string()),
-                Style::default().fg(Color::White),
-            ),
-            None => (
-                "Belum ada".to_string(),
-                "-".to_string(),
-                Style::default().fg(WARN),
-            ),
-        };
-        let aktif = i == app.jenis_cursor;
-        let marker = if aktif { "▶ " } else { "  " };
-        let baris = Line::from(vec![
-            Span::raw(format!("{marker}{:<NAMA_W$}", truncate(&nama, NAMA_W))),
-            Span::styled(
-                format!("{:<NOMOR_W$}", truncate(&nomor, NOMOR_W)),
-                nomor_gaya,
-            ),
-            Span::styled(tanggal, Style::default().fg(MUTED)),
-        ]);
-        lines.push(if aktif { baris.style(sorot()) } else { baris });
-    }
+    // Progres: jenis dokumen yang sudah punya nomor dari seluruh jenis.
+    let terisi = app
+        .jenis
+        .iter()
+        .filter_map(|j| j.get("id").and_then(serde_json::Value::as_u64))
+        .filter(|t| register_untuk_jenis(value, *t).is_some())
+        .count();
+    let total = app.jenis.len();
+    let rasio = if total == 0 {
+        0.0
+    } else {
+        terisi as f64 / total as f64
+    };
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(OK).bg(Color::Rgb(0x2A, 0x2F, 0x3A)))
+        .ratio(rasio.clamp(0.0, 1.0))
+        .label(format!(
+            "{terisi} dari {total} jenis dokumen sudah bernomor"
+        ));
+    frame.render_widget(gauge, progres);
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(panel("Register"))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    let header_tabel = Row::new(vec![
+        Cell::from("Jenis dokumen"),
+        Cell::from("Nomor"),
+        Cell::from("Tanggal"),
+    ])
+    .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let baris: Vec<Row> = app
+        .jenis
+        .iter()
+        .map(|j| {
+            let nama = format!(
+                "{} ({})",
+                j.get("name")
+                    .and_then(crate::app::scalar_text)
+                    .unwrap_or_default(),
+                j.get("code")
+                    .and_then(crate::app::scalar_text)
+                    .unwrap_or_default()
+            );
+            let type_id = j.get("id").and_then(serde_json::Value::as_u64);
+            let reg = type_id.and_then(|t| register_untuk_jenis(value, t));
+            let (nomor, tanggal, gaya) = match &reg {
+                Some(r) => (
+                    r.get("nomor")
+                        .and_then(crate::app::scalar_text)
+                        .unwrap_or_else(|| "-".to_string()),
+                    r.get("tanggal")
+                        .and_then(crate::app::scalar_text)
+                        .map(|t| t.chars().take(10).collect::<String>())
+                        .unwrap_or_else(|| "-".to_string()),
+                    Style::default().fg(Color::White),
+                ),
+                None => (
+                    "Belum ada".to_string(),
+                    "-".to_string(),
+                    Style::default().fg(WARN),
+                ),
+            };
+            Row::new(vec![
+                Cell::from(truncate(&nama, NAMA_W)),
+                Cell::from(Span::styled(truncate(&nomor, NOMOR_W), gaya)),
+                Cell::from(Span::styled(tanggal, Style::default().fg(MUTED))),
+            ])
+        })
+        .collect();
+    let tabel = Table::new(
+        baris,
+        [
+            Constraint::Length(NAMA_W as u16),
+            Constraint::Length(NOMOR_W as u16),
+            Constraint::Min(10),
+        ],
+    )
+    .header(header_tabel)
+    .row_highlight_style(sorot())
+    .highlight_symbol("▶ ")
+    .column_spacing(2);
+    let mut state = TableState::default().with_selected(if app.jenis.is_empty() {
+        None
+    } else {
+        Some(app.jenis_cursor)
+    });
+    frame.render_stateful_widget(tabel, tabel_area, &mut state);
+    render_scrollbar(frame, tabel_area, app.jenis.len(), app.jenis_cursor);
 }
 
 /// Potong teks ke lebar `n` karakter, dengan elipsis bila terpotong.

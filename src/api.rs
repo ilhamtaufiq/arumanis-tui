@@ -48,15 +48,6 @@ impl Module {
             Module::Pekerjaan | Module::Kontrak | Module::DocumentRegister => "tahun",
         }
     }
-
-    /// Kunci yang dipakai untuk judul baris, dicoba berurutan. Field lain tetap tampil di detail.
-    pub fn label_keys(self) -> &'static [&'static str] {
-        match self {
-            Module::Pekerjaan => &["nama_paket", "kode_rekening"],
-            Module::Kontrak => &["nomor", "spk", "kode_paket"],
-            Module::DocumentRegister => &["nama_paket", "kode_rekening"],
-        }
-    }
 }
 
 /// Error dari API atau jaringan. `errors` berisi pesan validasi per field (status 422).
@@ -109,6 +100,16 @@ impl Client {
             http,
             token: None,
         })
+    }
+
+    /// Token login yang sedang dipakai, untuk disimpan sebagai sesi offline.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// Memakai token dari sesi offline yang sudah dibuka.
+    pub fn pakai_token(&mut self, token: String) {
+        self.token = Some(token);
     }
 
     pub fn login(&mut self, email: &str, password: &str) -> Result<(), ApiError> {
