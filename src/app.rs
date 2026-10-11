@@ -309,6 +309,55 @@ impl App {
     }
 }
 
+/// Baris detail datar: `(label, nilai)`. Objek bersarang diberi awalan `induk.`, sampai dua tingkat.
+/// Daftar ditampilkan sebagai jumlah lalu satu baris per item (maks 10), dengan teks dari kunci judul.
+pub fn detail_rows(value: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    push_rows(value, "", 0, &mut out);
+    out
+}
+
+fn push_rows(value: &Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
+    let Some(obj) = value.as_object() else {
+        out.push((prefix.trim_end_matches('.').to_string(), scalar_text(value).unwrap_or_default()));
+        return;
+    };
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    for key in keys {
+        let v = &obj[key];
+        let label = format!("{prefix}{key}");
+        match v {
+            Value::Object(_) if depth < 2 => push_rows(v, &format!("{label}."), depth + 1, out),
+            Value::Array(items) => {
+                out.push((label.clone(), format!("{} item", items.len())));
+                for item in items.iter().take(10) {
+                    out.push((format!("  {label}"), item_title(item)));
+                }
+                if items.len() > 10 {
+                    out.push((format!("  {label}"), format!("…dan {} lagi", items.len() - 10)));
+                }
+            }
+            Value::Object(_) => out.push((label, "(objek)".to_string())),
+            _ => out.push((label, scalar_text(v).unwrap_or_else(|| "-".to_string()))),
+        }
+    }
+}
+
+/// Judul satu item dalam daftar relasi: kunci nama yang umum, lalu id.
+fn item_title(item: &Value) -> String {
+    const KEYS: [&str; 6] = ["nama_paket", "nomor", "name", "spk", "nama", "code"];
+    for k in KEYS {
+        if let Some(t) = item.get(k).and_then(scalar_text).filter(|t| !t.is_empty()) {
+            return t;
+        }
+    }
+    match item.get("id").and_then(Value::as_u64) {
+        Some(id) => format!("#{id}"),
+        None => scalar_text(item).unwrap_or_else(|| item.to_string()),
+    }
+}
+
 /// Teks untuk nilai skalar. Objek dan array tidak ditampilkan di daftar.
 pub fn scalar_text(v: &Value) -> Option<String> {
     match v {
@@ -344,6 +393,23 @@ mod tests {
         let mut a = app();
         a.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(a.should_quit);
+    }
+
+    #[test]
+    fn detail_rows_meratakan_relasi_dan_daftar() {
+        let v = json!({
+            "id": 3,
+            "nomor": "K-1",
+            "penyedia": { "nama": "CV Air" },
+            "pekerjaan": [{ "id": 9, "nama_paket": "Jaringan A" }, { "id": 10 }]
+        });
+        let rows = detail_rows(&v);
+        let get = |k: &str| rows.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+        assert_eq!(get("nomor").as_deref(), Some("K-1"));
+        assert_eq!(get("penyedia.nama").as_deref(), Some("CV Air"));
+        assert_eq!(get("pekerjaan").as_deref(), Some("2 item"));
+        assert!(rows.iter().any(|(l, v)| l == "  pekerjaan" && v == "Jaringan A"));
+        assert!(rows.iter().any(|(l, v)| l == "  pekerjaan" && v == "#10"));
     }
 
     #[test]

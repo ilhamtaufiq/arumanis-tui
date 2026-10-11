@@ -11,7 +11,7 @@ use ratatui::{
 use chrono::Datelike;
 
 use crate::api::Module;
-use crate::app::{scalar_text, App, Screen};
+use crate::app::{detail_rows, App, Screen};
 
 const ACCENT: Color = Color::Rgb(0x0B, 0x3B, 0x78);
 
@@ -157,27 +157,17 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("Tidak ada detail."), area);
         return;
     };
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(obj) = value.as_object() {
-        let mut keys: Vec<&String> = obj.keys().collect();
-        keys.sort();
-        for key in keys {
-            let text = scalar_text(&obj[key]).unwrap_or_else(|| {
-                let raw = obj[key].to_string();
-                if raw.chars().count() > 120 {
-                    format!("{}…", raw.chars().take(120).collect::<String>())
-                } else {
-                    raw
-                }
-            });
-            lines.push(Line::from(vec![
-                Span::styled(format!("{key:<28}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-                Span::raw(text),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(value.to_string()));
-    }
+    let lines: Vec<Line> = detail_rows(value)
+        .into_iter()
+        .map(|(label, text)| {
+            let style = if label.starts_with(' ') {
+                Style::default().fg(Color::Gray)
+            } else {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![Span::styled(format!("{label:<28}"), style), Span::raw(text)])
+        })
+        .collect();
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered())
         .wrap(Wrap { trim: false });
