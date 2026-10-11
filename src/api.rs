@@ -5,11 +5,15 @@ use std::fmt;
 use anyhow::Result;
 use reqwest::blocking::{Client as Http, Response};
 use reqwest::header::{AUTHORIZATION, SET_COOKIE};
+use reqwest::Method;
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE: &str = "https://apiamis.cianjur.space/api";
 const TOKEN_COOKIE: &str = "arumanis_token";
 const PER_PAGE: u32 = 20;
+const LOOKUP_PER_PAGE: u32 = 100;
+/// Batas halaman saat menarik seluruh lookup, supaya tidak berputar tanpa akhir.
+const MAX_HALAMAN: u32 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Module {
@@ -120,7 +124,10 @@ impl Client {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .find_map(|c| c.strip_prefix(&format!("{TOKEN_COOKIE}=")).map(cookie_value));
+            .find_map(|c| {
+                c.strip_prefix(&format!("{TOKEN_COOKIE}="))
+                    .map(cookie_value)
+            });
         check(resp)?;
         match token {
             Some(t) if !t.is_empty() => {
@@ -137,7 +144,10 @@ impl Client {
 
     /// Mencabut token di server, lalu membuangnya dari memori meskipun request gagal.
     pub fn logout(&mut self) -> Result<(), ApiError> {
-        let token = self.token.take().ok_or_else(|| ApiError::local("Belum login"))?;
+        let token = self
+            .token
+            .take()
+            .ok_or_else(|| ApiError::local("Belum login"))?;
         let resp = self
             .http
             .post(format!("{}/auth/logout", self.base))
@@ -147,29 +157,71 @@ impl Client {
         check(resp).map(|_| ())
     }
 
-    pub fn list(&self, m: Module, page: u32, search: &str, year: i32) -> Result<Vec<Value>, ApiError> {
+    pub fn list(
+        &self,
+        m: Module,
+        page: u32,
+        search: &str,
+        year: i32,
+    ) -> Result<Vec<Value>, ApiError> {
         let mut req = self
             .auth(self.http.get(format!("{}/{}", self.base, m.path())))?
-            .query(&[("page", page.to_string()), ("per_page", PER_PAGE.to_string())])
+            .query(&[
+                ("page", page.to_string()),
+                ("per_page", PER_PAGE.to_string()),
+            ])
             .query(&[(m.year_param(), year.to_string())]);
         if !search.trim().is_empty() {
             req = req.query(&[("search", search.trim())]);
         }
         let body = check(req.send().map_err(ApiError::network)?)?;
-        match body.get("data").and_then(Value::as_array) {
-            Some(rows) => Ok(rows.clone()),
-            None => Err(ApiError {
-                status: 200,
-                message: "Format respons daftar tidak dikenali".to_string(),
-                errors: Vec::new(),
-            }),
-        }
+        halaman(&body).map(|(rows, _)| rows)
     }
 
     pub fn detail(&self, m: Module, id: u64) -> Result<Value, ApiError> {
         let req = self.auth(self.http.get(format!("{}/{}/{id}", self.base, m.path())))?;
         let body = check(req.send().map_err(ApiError::network)?)?;
         Ok(body.get("data").cloned().unwrap_or(body))
+    }
+
+    /// Seluruh isi lookup (kegiatan, kecamatan, desa, pengawas, jenis dokumen). Mengikuti halaman bila respons paginasi.
+    pub fn lookup(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<Value>, ApiError> {
+        let mut rows = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let req = self
+                .auth(self.http.get(self.url(path)))?
+                .query(query)
+                .query(&[
+                    ("page", page.to_string()),
+                    ("per_page", LOOKUP_PER_PAGE.to_string()),
+                ]);
+            let body = check(req.send().map_err(ApiError::network)?)?;
+            let (data, last_page) = halaman(&body)?;
+            rows.extend(data);
+            match last_page {
+                Some(last) if page < last && page < MAX_HALAMAN => page += 1,
+                _ => return Ok(rows),
+            }
+        }
+    }
+
+    /// Kirim body JSON dengan POST atau PUT. Mengembalikan isi `data` bila ada.
+    pub fn kirim(&self, metode: &str, path: &str, body: &Value) -> Result<Value, ApiError> {
+        let method = if metode == "PUT" {
+            Method::PUT
+        } else {
+            Method::POST
+        };
+        let req = self
+            .auth(self.http.request(method, self.url(path)))?
+            .json(body);
+        let resp = check(req.send().map_err(ApiError::network)?)?;
+        Ok(resp.get("data").cloned().unwrap_or(resp))
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}/{}", self.base, path.trim_start_matches('/'))
     }
 
     fn auth(
@@ -181,6 +233,27 @@ impl Client {
             None => Err(ApiError::local("Belum login")),
         }
     }
+}
+
+/// Baris `data` dari respons daftar, dan `last_page` bila respons paginasi. Array polos juga diterima.
+fn halaman(body: &Value) -> Result<(Vec<Value>, Option<u32>), ApiError> {
+    if let Some(rows) = body.as_array() {
+        return Ok((rows.clone(), None));
+    }
+    let rows = body
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError {
+            status: 200,
+            message: "Format respons daftar tidak dikenali".to_string(),
+            errors: Vec::new(),
+        })?;
+    let last = body
+        .pointer("/meta/last_page")
+        .or_else(|| body.get("last_page"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    Ok((rows.clone(), last))
 }
 
 /// Nilai cookie sampai `;`, lalu di-decode dari persen-encoding (`|` sering datang sebagai `%7C`).
@@ -260,6 +333,16 @@ mod tests {
     }
 
     #[test]
+    fn halaman_membaca_array_polos_dan_paginasi() {
+        let (rows, last) = halaman(&json!([{ "id": 1 }])).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(last, None);
+        let (_, last) = halaman(&json!({ "data": [], "meta": { "last_page": 3 } })).unwrap();
+        assert_eq!(last, Some(3));
+        assert!(halaman(&json!({ "pesan": "x" })).is_err());
+    }
+
+    #[test]
     fn percent_decode_menangani_karakter_di_akhir() {
         assert_eq!(percent_decode("a%7C"), "a|");
         assert_eq!(percent_decode("100%"), "100%");
@@ -274,19 +357,33 @@ mod tests {
         let password = std::env::var("APIAMIS_TEST_PASSWORD").expect("APIAMIS_TEST_PASSWORD");
         let mut c = Client::new(base).unwrap();
 
-        assert!(c.list(Module::Pekerjaan, 1, "", 2026).is_err(), "sebelum login harus ditolak");
+        assert!(
+            c.list(Module::Pekerjaan, 1, "", 2026).is_err(),
+            "sebelum login harus ditolak"
+        );
         c.login(&email, &password).expect("login");
 
         for m in Module::ALL {
-            let rows = c.list(m, 1, "", 2026).unwrap_or_else(|e| panic!("list {}: {e}", m.title()));
+            let rows = c
+                .list(m, 1, "", 2026)
+                .unwrap_or_else(|e| panic!("list {}: {e}", m.title()));
             println!("{}: {} baris", m.title(), rows.len());
-            if let Some(id) = rows.first().and_then(|r| r.get("id")).and_then(Value::as_u64) {
-                let d = c.detail(m, id).unwrap_or_else(|e| panic!("detail {}: {e}", m.title()));
+            if let Some(id) = rows
+                .first()
+                .and_then(|r| r.get("id"))
+                .and_then(Value::as_u64)
+            {
+                let d = c
+                    .detail(m, id)
+                    .unwrap_or_else(|e| panic!("detail {}: {e}", m.title()));
                 assert!(d.is_object(), "detail {} harus objek", m.title());
             }
         }
 
         c.logout().expect("logout");
-        assert!(c.list(Module::Pekerjaan, 1, "", 2026).is_err(), "setelah logout harus ditolak");
+        assert!(
+            c.list(Module::Pekerjaan, 1, "", 2026).is_err(),
+            "setelah logout harus ditolak"
+        );
     }
 }

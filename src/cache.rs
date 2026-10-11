@@ -1,5 +1,5 @@
-//! Cache baca offline: hasil daftar terakhir disimpan sebagai JSON per modul, tahun, dan halaman.
-//! Hanya data daftar. Token login tidak pernah ditulis ke disk.
+//! Cache baca offline: hasil daftar dan lookup terakhir disimpan sebagai JSON.
+//! Hanya data baca. Token login tidak pernah ditulis ke disk.
 
 use std::path::PathBuf;
 
@@ -30,12 +30,30 @@ fn file_for(m: Module, year: i32, page: u32, search: &str) -> Option<PathBuf> {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(40)
         .collect();
-    let name = format!("{}-{year}-p{page}-{key}.json", m.title().replace(' ', "_").to_lowercase());
+    let name = format!(
+        "{}-{year}-p{page}-{key}.json",
+        m.title().replace(' ', "_").to_lowercase()
+    );
     dir().map(|d| d.join(name))
 }
 
-pub fn save(m: Module, year: i32, page: u32, search: &str, rows: &[Value]) {
-    let Some(path) = file_for(m, year, page, search) else {
+/// Lookup dipakai dengan nama logis, mis. "kegiatan-2026" atau "desa-3".
+fn named_file(nama: &str) -> Option<PathBuf> {
+    let key: String = nama
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir().map(|d| d.join(format!("lookup-{key}.json")))
+}
+
+fn write_snapshot(path: Option<PathBuf>, rows: &[Value]) {
+    let Some(path) = path else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -50,12 +68,27 @@ pub fn save(m: Module, year: i32, page: u32, search: &str, rows: &[Value]) {
     }
 }
 
-/// Baris tersimpan dan waktu penyimpanannya (Unix detik). `None` bila belum ada atau rusak.
-pub fn load(m: Module, year: i32, page: u32, search: &str) -> Option<(Vec<Value>, i64)> {
-    let path = file_for(m, year, page, search)?;
-    let text = std::fs::read_to_string(path).ok()?;
+fn read_snapshot(path: Option<PathBuf>) -> Option<(Vec<Value>, i64)> {
+    let text = std::fs::read_to_string(path?).ok()?;
     let snap: Snapshot = serde_json::from_str(&text).ok()?;
     Some((snap.rows, snap.saved_at))
+}
+
+pub fn save(m: Module, year: i32, page: u32, search: &str, rows: &[Value]) {
+    write_snapshot(file_for(m, year, page, search), rows);
+}
+
+/// Baris tersimpan dan waktu penyimpanannya (Unix detik). `None` bila belum ada atau rusak.
+pub fn load(m: Module, year: i32, page: u32, search: &str) -> Option<(Vec<Value>, i64)> {
+    read_snapshot(file_for(m, year, page, search))
+}
+
+pub fn save_named(nama: &str, rows: &[Value]) {
+    write_snapshot(named_file(nama), rows);
+}
+
+pub fn load_named(nama: &str) -> Option<(Vec<Value>, i64)> {
+    read_snapshot(named_file(nama))
 }
 
 /// Waktu simpan untuk ditampilkan di status bar, dalam zona waktu lokal.
@@ -102,9 +135,12 @@ mod tests {
         std::env::set_var("LOCALAPPDATA", &tmp);
         let rows = vec![json!({ "id": 1, "nomor": "A" })];
         save(Module::DocumentRegister, 2026, 1, "surat", &rows);
-        let (loaded, saved_at) = load(Module::DocumentRegister, 2026, 1, "surat").expect("cache ada");
+        let (loaded, saved_at) =
+            load(Module::DocumentRegister, 2026, 1, "surat").expect("cache ada");
         assert_eq!(loaded, rows);
         assert!(saved_at > 0);
+        save_named("desa-3", &rows);
+        assert_eq!(load_named("desa-3").map(|(r, _)| r), Some(rows));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
