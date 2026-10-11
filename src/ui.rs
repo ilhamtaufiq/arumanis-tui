@@ -11,7 +11,7 @@ use ratatui::{
 use chrono::Datelike;
 
 use crate::api::Module;
-use crate::app::{detail_rows, App, Screen};
+use crate::app::{detail_rows, nama_pekerjaan_register, App, Screen};
 use crate::form::{Form, Kind};
 
 const ACCENT: Color = Color::Rgb(0x0B, 0x3B, 0x78);
@@ -362,7 +362,12 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("Tidak ada detail."), area);
         return;
     };
-    let lines: Vec<Line> = detail_rows(value)
+    let mut baris = detail_rows(value);
+    if app.module == Module::DocumentRegister {
+        let pekerjaan = nama_pekerjaan_register(value).unwrap_or_else(|| "-".to_string());
+        baris.insert(0, ("Pekerjaan".to_string(), pekerjaan));
+    }
+    let lines: Vec<Line> = baris
         .into_iter()
         .map(|(label, text)| {
             if label.starts_with(' ') {
