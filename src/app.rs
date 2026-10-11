@@ -288,6 +288,13 @@ impl App {
             self.status = "Baris ini tidak punya id.".to_string();
             return;
         };
+        // Register: server belum punya GET /document-registers/{id}. Baris daftar sudah memuat
+        // kontrak, pekerjaan, dan jenis dokumen, jadi itu yang dipakai sebagai detail.
+        if self.module == Module::DocumentRegister {
+            self.detail = Some(row.clone());
+            self.screen = Screen::Detail;
+            return;
+        }
         match self.client.detail(self.module, id) {
             Ok(v) => {
                 self.detail = Some(v);
@@ -701,6 +708,14 @@ fn hari_ini() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// Nama pekerjaan induk sebuah register: `kontrak.pekerjaan.nama_paket`.
+pub fn nama_pekerjaan_register(value: &Value) -> Option<String> {
+    value
+        .pointer("/kontrak/pekerjaan/nama_paket")
+        .and_then(scalar_text)
+        .filter(|s| !s.is_empty())
+}
+
 /// Baris detail datar: `(label, nilai)`. Objek bersarang diberi awalan `induk.`, sampai dua tingkat.
 /// Daftar ditampilkan sebagai jumlah lalu satu baris per item (maks 10), dengan teks dari kunci judul.
 pub fn detail_rows(value: &Value) -> Vec<(String, String)> {
@@ -810,6 +825,13 @@ mod tests {
             .iter()
             .any(|(l, v)| l == "  pekerjaan" && v == "Jaringan A"));
         assert!(rows.iter().any(|(l, v)| l == "  pekerjaan" && v == "#10"));
+    }
+
+    #[test]
+    fn nama_pekerjaan_register_diambil_dari_kontrak() {
+        let reg = json!({ "id": 1, "kontrak": { "id": 3, "pekerjaan": { "id": 9, "nama_paket": "Jaringan A" } } });
+        assert_eq!(nama_pekerjaan_register(&reg).as_deref(), Some("Jaringan A"));
+        assert_eq!(nama_pekerjaan_register(&json!({ "id": 1 })), None);
     }
 
     #[test]
