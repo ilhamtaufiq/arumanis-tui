@@ -813,24 +813,6 @@ impl App {
     fn baru_id(&self) -> u64 {
         chrono::Utc::now().timestamp_millis().max(0) as u64 + self.antrean.len() as u64
     }
-
-    /// Label singkat sebuah baris untuk daftar, dari kunci yang tersedia.
-    pub fn row_label(&self, row: &Value) -> String {
-        let parts: Vec<String> = self
-            .module
-            .label_keys()
-            .iter()
-            .filter_map(|k| row.get(*k))
-            .filter_map(scalar_text)
-            .filter(|s| !s.is_empty())
-            .take(2)
-            .collect();
-        if parts.is_empty() {
-            format!("#{}", row.get("id").and_then(Value::as_u64).unwrap_or(0))
-        } else {
-            parts.join(" · ")
-        }
-    }
 }
 
 fn hari_ini() -> String {
@@ -944,16 +926,6 @@ mod tests {
 
     fn app() -> App {
         App::new(Client::new(DEFAULT_BASE.to_string()).unwrap())
-    }
-
-    #[test]
-    fn label_memakai_kunci_pertama_yang_ada() {
-        let mut a = app();
-        a.module = Module::Kontrak;
-        let row = json!({ "id": 7, "spk": "SPK-1", "kode_paket": "K-9" });
-        assert_eq!(a.row_label(&row), "SPK-1 · K-9");
-        let kosong = json!({ "id": 7 });
-        assert_eq!(a.row_label(&kosong), "#7");
     }
 
     #[test]

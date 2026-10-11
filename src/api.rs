@@ -48,15 +48,6 @@ impl Module {
             Module::Pekerjaan | Module::Kontrak | Module::DocumentRegister => "tahun",
         }
     }
-
-    /// Kunci yang dipakai untuk judul baris, dicoba berurutan. Field lain tetap tampil di detail.
-    pub fn label_keys(self) -> &'static [&'static str] {
-        match self {
-            Module::Pekerjaan => &["nama_paket", "kode_rekening"],
-            Module::Kontrak => &["nomor", "spk", "kode_paket"],
-            Module::DocumentRegister => &["nama_paket", "kode_rekening"],
-        }
-    }
 }
 
 /// Error dari API atau jaringan. `errors` berisi pesan validasi per field (status 422).

@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
+        TableState, Wrap,
+    },
     Frame,
 };
 
@@ -303,44 +306,160 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(teks_cari).block(panel(&judul)), cari_area);
 
-    let mut items: Vec<ListItem> = antrean
+    let (headers, widths) = kolom_modul(app.module);
+    let mut rows: Vec<Row> = antrean
         .iter()
-        .map(|p| match &p.galat {
-            Some(g) => ListItem::new(Line::from(vec![
-                Span::styled("✖ ", Style::default().fg(ERR)),
-                Span::raw(format!("{}  ", p.label)),
-                Span::styled(format!("ditolak: {g}"), Style::default().fg(ERR)),
-            ])),
-            None => ListItem::new(Line::from(vec![
-                Span::styled("⧗ ", Style::default().fg(WARN)),
-                Span::raw(format!("{}  ", p.label)),
-                Span::styled("menunggu kirim", Style::default().fg(WARN)),
-            ])),
+        .map(|p| {
+            let (ikon, warna, status) = match &p.galat {
+                Some(g) => ("✖", ERR, format!("ditolak: {g}")),
+                None => ("⧗", WARN, "menunggu kirim".to_string()),
+            };
+            let mut cells: Vec<Cell> = vec![Cell::from(format!("{ikon} {}", p.label))];
+            cells.extend(std::iter::repeat_with(|| Cell::from("")).take(headers.len() - 2));
+            cells.push(Cell::from(status));
+            Row::new(cells).style(Style::default().fg(warna))
         })
         .collect();
-    let offset = items.len();
+    let offset = rows.len();
     if app.rows.is_empty() {
-        items.push(ListItem::new(Span::styled(
+        rows.push(Row::new(vec![Cell::from(Span::styled(
             "Tidak ada data di halaman ini.",
             Style::default().fg(MUTED),
-        )));
+        ))]));
     } else {
-        items.extend(app.rows.iter().map(|r| ListItem::new(app.row_label(r))));
+        rows.extend(app.rows.iter().map(|r| Row::new(sel_kolom(app.module, r))));
     }
-    let list = List::new(items)
+    let header = Row::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let table = Table::new(rows, widths)
+        .header(header)
         .block(panel("Daftar"))
-        .highlight_style(sorot())
-        .highlight_symbol("▶ ");
+        .row_highlight_style(sorot())
+        .highlight_symbol("▶ ")
+        .column_spacing(2);
     let selected = if app.rows.is_empty() {
         None
     } else {
         Some(offset + app.selected)
     };
-    let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(list, rows_area, &mut state);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, rows_area, &mut state);
 
     if let Some(idx) = app.year_menu {
         draw_year_menu(frame, rows_area, idx);
+    }
+}
+
+/// Judul dan lebar kolom daftar per modul.
+fn kolom_modul(m: Module) -> (Vec<&'static str>, Vec<Constraint>) {
+    match m {
+        Module::Pekerjaan => (
+            vec!["Nama paket", "Kode rekening", "Pagu", "Status"],
+            vec![
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(16),
+                Constraint::Length(16),
+            ],
+        ),
+        Module::Kontrak => (
+            vec!["SPK", "Kode paket", "Nilai kontrak", "Tgl SPK"],
+            vec![
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(18),
+                Constraint::Length(12),
+            ],
+        ),
+        Module::DocumentRegister => (
+            vec!["Nama paket", "Kode rekening", "Kontrak", "Register"],
+            vec![
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        ),
+    }
+}
+
+/// Sel untuk satu baris data, sesuai kolom modul.
+fn sel_kolom(m: Module, row: &serde_json::Value) -> Vec<Cell<'static>> {
+    let teks = |k: &str| {
+        row.get(k)
+            .and_then(crate::app::scalar_text)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let tanggal = |k: &str| teks(k).chars().take(10).collect::<String>();
+    let jumlah_kontrak = row
+        .get("kontrak")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let jumlah_register: usize = row
+        .get("kontrak")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |ks| {
+            ks.iter()
+                .map(|k| {
+                    k.get("registers")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len)
+                })
+                .sum()
+        });
+    match m {
+        Module::Pekerjaan => vec![
+            Cell::from(teks("nama_paket")),
+            Cell::from(teks("kode_rekening")),
+            Cell::from(rupiah(row.get("pagu"))).style(Style::default().fg(Color::White)),
+            Cell::from(status_teks(&teks("status"))),
+        ],
+        Module::Kontrak => vec![
+            Cell::from(teks("spk")),
+            Cell::from(teks("kode_paket")),
+            Cell::from(rupiah(row.get("nilai_kontrak"))),
+            Cell::from(tanggal("tgl_spk")),
+        ],
+        Module::DocumentRegister => vec![
+            Cell::from(teks("nama_paket")),
+            Cell::from(teks("kode_rekening")),
+            Cell::from(jumlah_kontrak.to_string()),
+            Cell::from(Span::styled(
+                format!("{jumlah_register} nomor"),
+                Style::default().fg(if jumlah_register > 0 { OK } else { MUTED }),
+            )),
+        ],
+    }
+}
+
+fn status_teks(s: &str) -> String {
+    match s {
+        "active" => "aktif".to_string(),
+        "canceled" => "batal".to_string(),
+        "-" => "-".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Angka sebagai rupiah dengan pemisah ribuan titik, mis. `1.500.000`. `-` bila kosong.
+fn rupiah(v: Option<&serde_json::Value>) -> String {
+    let n = v.and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()));
+    let Some(n) = n else {
+        return "-".to_string();
+    };
+    let angka = format!("{:.0}", n.abs());
+    let mut out = String::new();
+    for (i, c) in angka.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    let out: String = out.chars().rev().collect();
+    if n < 0.0 {
+        format!("-{out}")
+    } else {
+        out
     }
 }
 
