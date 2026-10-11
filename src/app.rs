@@ -318,6 +318,8 @@ impl App {
                     self.load();
                 }
             }
+            KeyCode::Tab => self.ganti_modul(1),
+            KeyCode::BackTab => self.ganti_modul(-1),
             KeyCode::Char('/') => {
                 self.searching = true;
             }
@@ -337,6 +339,20 @@ impl App {
             KeyCode::Enter => self.open_detail(),
             _ => {}
         }
+    }
+
+    /// Pindah ke modul sebelah (`delta` = 1) atau sebelumnya (-1) lewat tab di daftar.
+    fn ganti_modul(&mut self, delta: isize) {
+        let n = Module::ALL.len() as isize;
+        let idx = Module::ALL
+            .iter()
+            .position(|m| *m == self.module)
+            .unwrap_or(0) as isize;
+        self.module = Module::ALL[(idx + delta).rem_euclid(n) as usize];
+        self.page = 1;
+        self.search.clear();
+        self.selected = 0;
+        self.load();
     }
 
     fn open_detail(&mut self) {
