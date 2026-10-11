@@ -11,8 +11,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-/// Masa berlaku sesi offline. Dibatasi juga oleh masa token di server: saat sinkron, server tetap memutuskan.
-pub const MASA_BERLAKU_DETIK: i64 = 12 * 3600;
+/// Masa berlaku sesi offline (30 hari). Saat sinkron, server tetap memutuskan: token di server harus masih berlaku.
+pub const MASA_BERLAKU_DETIK: i64 = 30 * 24 * 3600;
 const ITERASI: u32 = 100_000;
 const SALT: usize = 16;
 const NONCE: usize = 12;

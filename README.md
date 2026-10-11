@@ -40,7 +40,9 @@ Login offline:
 - Setiap login online berhasil, token disimpan di `sesi.bin` (folder cache yang sama) dalam keadaan terenkripsi
   AES-256-GCM. Kuncinya diturunkan dari password dengan PBKDF2, jadi tidak ada kunci yang disimpan terpisah.
 - Saat server tidak bisa dihubungi, login memakai sesi itu bila email dan password cocok dan sesi belum kedaluwarsa.
-  Masa berlakunya 12 jam. Saat sinkron, server tetap memutuskan: bila token di server sudah habis, masuk online lagi.
+  Masa berlakunya 30 hari. Saat sinkron, server tetap memutuskan: bila token di server sudah habis, masuk online lagi.
+  Token di server default-nya 12 jam (`SANCTUM_TOKEN_EXPIRATION`=720 menit), jadi sesi 30 hari hanya berguna
+  penuh bila server juga diatur ke 30 hari (43200 menit).
 - Login online baru menggantikan sesi yang tersimpan. Keluar (logout) menghapus `sesi.bin`.
 - Lookup dan daftar tidak terenkripsi (hanya data baca).
 
