@@ -11,7 +11,7 @@ use ratatui::{
 use chrono::Datelike;
 
 use crate::api::Module;
-use crate::app::{detail_rows, nama_pekerjaan_register, App, Screen};
+use crate::app::{detail_rows, kontrak_utama, register_untuk_jenis, App, Screen};
 use crate::form::{Form, Kind};
 
 const ACCENT: Color = Color::Rgb(0x0B, 0x3B, 0x78);
@@ -103,8 +103,10 @@ fn help_pairs(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("t", "tahun"),
                 ("←→", "halaman"),
             ];
-            if app.module == Module::Pekerjaan {
-                v.push(("n", "baru"));
+            match app.module {
+                Module::Pekerjaan => v.push(("n", "baru")),
+                Module::DocumentRegister => v.push(("S", "sequence")),
+                Module::Kontrak => {}
             }
             v.extend([
                 ("s", "kirim antrean"),
@@ -117,7 +119,11 @@ fn help_pairs(app: &App) -> Vec<(&'static str, &'static str)> {
             let mut v = vec![("Esc", "kembali")];
             match app.module {
                 Module::Kontrak => v.push(("n", "register baru")),
-                _ => v.push(("e", "ubah")),
+                Module::DocumentRegister => {
+                    v.push(("↑↓", "jenis"));
+                    v.push(("Enter", "isi/ubah nomor"));
+                }
+                Module::Pekerjaan => v.push(("e", "ubah")),
             }
             v
         }
@@ -287,6 +293,11 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     if app.cached_at.is_some() {
         judul.push_str(" · offline");
     }
+    if app.module == Module::DocumentRegister {
+        if let Some(seq) = app.sequence {
+            judul.push_str(&format!(" · sequence {seq}"));
+        }
+    }
     if !antrean.is_empty() {
         judul.push_str(&format!(" · {} menunggu", antrean.len()));
     }
@@ -362,12 +373,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("Tidak ada detail."), area);
         return;
     };
-    let mut baris = detail_rows(value);
     if app.module == Module::DocumentRegister {
-        let pekerjaan = nama_pekerjaan_register(value).unwrap_or_else(|| "-".to_string());
-        baris.insert(0, ("Pekerjaan".to_string(), pekerjaan));
+        draw_detail_register(frame, app, value, area);
+        return;
     }
-    let lines: Vec<Line> = baris
+    let lines: Vec<Line> = detail_rows(value)
         .into_iter()
         .map(|(label, text)| {
             if label.starts_with(' ') {
@@ -398,6 +408,129 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .block(panel("Detail"))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// Lebar kolom tabel jenis dokumen di detail register. Header dan baris memakai angka yang sama.
+const NAMA_W: usize = 30;
+const NOMOR_W: usize = 24;
+
+/// Detail register: header pekerjaan dan kontrak, lalu satu baris per jenis dokumen.
+/// Baris yang disorot adalah jenis yang dipilih. Enter mengisi atau mengubah nomornya.
+fn draw_detail_register(frame: &mut Frame, app: &App, value: &serde_json::Value, area: Rect) {
+    let teks = |k: &str| {
+        value
+            .get(k)
+            .and_then(crate::app::scalar_text)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let kontrak = kontrak_utama(value).and_then(|id| {
+        value
+            .get("kontrak")?
+            .as_array()?
+            .iter()
+            .find(|k| k.get("id").and_then(serde_json::Value::as_u64) == Some(id))
+    });
+    let spk = kontrak
+        .and_then(|k| k.get("spk"))
+        .and_then(crate::app::scalar_text)
+        .unwrap_or_else(|| "belum ada kontrak".to_string());
+    let penyedia = kontrak
+        .and_then(|k| k.pointer("/penyedia/nama"))
+        .and_then(crate::app::scalar_text)
+        .unwrap_or_else(|| "-".to_string());
+
+    let label = |t: &str| {
+        Span::styled(
+            format!("{t:<12}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            label("Pekerjaan"),
+            Span::styled(
+                teks("nama_paket"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![label("Kode rek."), Span::raw(teks("kode_rekening"))]),
+        Line::from(vec![label("Kontrak"), Span::raw(spk)]),
+        Line::from(vec![label("Penyedia"), Span::raw(penyedia)]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {:<NAMA_W$}{:<NOMOR_W$}{}",
+                "Jenis dokumen", "Nomor", "Tanggal"
+            ),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    if app.jenis.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Jenis dokumen belum dimuat.",
+            Style::default().fg(WARN),
+        )));
+    }
+    for (i, j) in app.jenis.iter().enumerate() {
+        let nama = format!(
+            "{} ({})",
+            j.get("name")
+                .and_then(crate::app::scalar_text)
+                .unwrap_or_default(),
+            j.get("code")
+                .and_then(crate::app::scalar_text)
+                .unwrap_or_default()
+        );
+        let type_id = j.get("id").and_then(serde_json::Value::as_u64);
+        let reg = type_id.and_then(|t| register_untuk_jenis(value, t));
+        let (nomor, tanggal, nomor_gaya) = match &reg {
+            Some(r) => (
+                r.get("nomor")
+                    .and_then(crate::app::scalar_text)
+                    .unwrap_or_else(|| "-".to_string()),
+                r.get("tanggal")
+                    .and_then(crate::app::scalar_text)
+                    .map(|t| t.chars().take(10).collect::<String>())
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(Color::White),
+            ),
+            None => (
+                "Belum ada".to_string(),
+                "-".to_string(),
+                Style::default().fg(WARN),
+            ),
+        };
+        let aktif = i == app.jenis_cursor;
+        let marker = if aktif { "▶ " } else { "  " };
+        let baris = Line::from(vec![
+            Span::raw(format!("{marker}{:<NAMA_W$}", truncate(&nama, NAMA_W))),
+            Span::styled(
+                format!("{:<NOMOR_W$}", truncate(&nomor, NOMOR_W)),
+                nomor_gaya,
+            ),
+            Span::styled(tanggal, Style::default().fg(MUTED)),
+        ]);
+        lines.push(if aktif { baris.style(sorot()) } else { baris });
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(panel("Register"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+/// Potong teks ke lebar `n` karakter, dengan elipsis bila terpotong.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
@@ -465,6 +598,12 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
         }
         spans.push(wajib);
         lines.push(Line::from(spans));
+        if let Some(h) = &f.hint {
+            lines.push(Line::from(Span::styled(
+                format!("{:<w$}{h}", "", w = lebar_label + 2),
+                Style::default().fg(ACCENT_SOFT),
+            )));
+        }
         if let Some(g) = &f.galat {
             lines.push(Line::from(Span::styled(
                 format!("{:<w$}✖ {g}", "", w = lebar_label + 2),

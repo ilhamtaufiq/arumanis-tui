@@ -2,6 +2,9 @@
 
 Aplikasi terminal (ratatui) untuk Arumanis: Pekerjaan, Kontrak, dan Register Dokumen.
 
+Daftar Register memuat pekerjaan beserta nomor per jenis dokumen, seperti halaman Register di frontend.
+Nomor baru dipratinjau dari template jenis dokumen. Sequence mengikuti tahun aktif.
+
 ## Menjalankan
 
 ```bash
@@ -17,7 +20,10 @@ Menu: ↑/↓ pilih, Enter buka, l keluar, q tutup.
 Daftar: ↑/↓ pilih, Enter detail, / cari, t tahun anggaran, ←/→ halaman, n pekerjaan baru,
 s kirim antrean, x buang perubahan yang ditolak server, Esc kembali.
 
-Detail: e ubah (Pekerjaan dan Register), n tambah register di dalam kontrak (Kontrak), Esc kembali.
+Detail pekerjaan: e ubah, Esc kembali.
+Detail register: ↑/↓ pilih jenis dokumen, Enter isi atau ubah nomornya, Esc kembali.
+Detail kontrak: n tambah register di dalam kontrak, Esc kembali.
+Register (daftar): S ubah nomor urut terakhir tahun aktif (sequence).
 
 Formulir: Tab/↑/↓ pindah isian, Enter buka dropdown atau pindah, Spasi centang, Ctrl+S simpan, Esc batal.
 Dropdown: ↑/↓ pilih, Enter pakai, Esc batal.

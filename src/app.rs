@@ -40,6 +40,11 @@ pub struct App {
     pub rows: Vec<Value>,
     pub selected: usize,
     pub detail: Option<Value>,
+    /// Jenis dokumen (`/document-types`) untuk detail register, dan baris yang disorot.
+    pub jenis: Vec<Value>,
+    pub jenis_cursor: usize,
+    /// Nomor urut terakhir tahun aktif. `None` bila belum dimuat.
+    pub sequence: Option<i64>,
     pub form: Option<Form>,
     /// Layar tempat formulir dibuka, untuk kembali setelah simpan atau batal.
     pub form_back: Screen,
@@ -68,6 +73,9 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             detail: None,
+            jenis: Vec::new(),
+            jenis_cursor: 0,
+            sequence: None,
             form: None,
             form_back: Screen::List,
             antrean: queue::load(),
@@ -196,6 +204,9 @@ impl App {
             }
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        if self.module == Module::DocumentRegister {
+            self.sequence = self.muat_sequence();
+        }
     }
 
     fn key_year_menu(&mut self, code: KeyCode) {
@@ -273,6 +284,9 @@ impl App {
             KeyCode::Char('n') if self.module == Module::Pekerjaan => {
                 self.open_form_pekerjaan(None)
             }
+            KeyCode::Char('S') if self.module == Module::DocumentRegister => {
+                self.open_form_sequence()
+            }
             KeyCode::Char('s') => self.sinkron(),
             KeyCode::Char('x') => self.buang_ditolak(),
             KeyCode::Enter => self.open_detail(),
@@ -281,7 +295,7 @@ impl App {
     }
 
     fn open_detail(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
             return;
         };
         let Some(id) = row.get("id").and_then(Value::as_u64) else {
@@ -291,7 +305,9 @@ impl App {
         // Register: server belum punya GET /document-registers/{id}. Baris daftar sudah memuat
         // kontrak, pekerjaan, dan jenis dokumen, jadi itu yang dipakai sebagai detail.
         if self.module == Module::DocumentRegister {
-            self.detail = Some(row.clone());
+            self.jenis = self.lookup("jenis-dokumen", "document-types", &[]);
+            self.jenis_cursor = 0;
+            self.detail = Some(row);
             self.screen = Screen::Detail;
             return;
         }
@@ -302,7 +318,7 @@ impl App {
             }
             // Offline: detail diambil dari baris daftar yang sudah ada.
             Err(e) if e.status == 0 => {
-                self.detail = Some(row.clone());
+                self.detail = Some(row);
                 self.screen = Screen::Detail;
                 self.status = "Offline: menampilkan data dari daftar.".to_string();
             }
@@ -316,7 +332,18 @@ impl App {
                 self.detail = None;
                 self.screen = Screen::List;
             }
-            KeyCode::Char('e') if self.module != Module::Kontrak => self.open_form_ubah(),
+            KeyCode::Up if self.module == Module::DocumentRegister => {
+                self.jenis_cursor = self.jenis_cursor.saturating_sub(1);
+            }
+            KeyCode::Down if self.module == Module::DocumentRegister => {
+                if self.jenis_cursor + 1 < self.jenis.len() {
+                    self.jenis_cursor += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e') if self.module == Module::DocumentRegister => {
+                self.open_form_jenis();
+            }
+            KeyCode::Char('e') if self.module == Module::Pekerjaan => self.open_form_ubah(),
             KeyCode::Char('n') if self.module == Module::Kontrak => self.open_form_register_baru(),
             _ => {}
         }
@@ -375,23 +402,49 @@ impl App {
         };
         match self.module {
             Module::Pekerjaan => self.open_form_pekerjaan(Some(id)),
-            Module::DocumentRegister => {
-                let kontrak_id = detail
-                    .get("kontrak_id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let jenis = self.lookup("jenis-dokumen", "document-types", &[]);
-                let f = Form::register(
-                    Some(id),
-                    kontrak_id,
-                    Some(&detail),
-                    form::pilihan(&jenis, &["name", "code"]),
-                    &hari_ini(),
-                );
-                self.buka_form(f);
-            }
+            Module::DocumentRegister => self.open_form_jenis(),
             Module::Kontrak => {}
         }
+    }
+
+    /// Isi atau ubah nomor untuk jenis dokumen yang dipilih di detail pekerjaan.
+    /// Sudah ada register: formulir ubah. Belum ada: formulir baru di kontrak utama.
+    fn open_form_jenis(&mut self) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let Some(jenis) = self.jenis.get(self.jenis_cursor).cloned() else {
+            self.status = "Jenis dokumen belum dimuat.".to_string();
+            return;
+        };
+        let Some(type_id) = jenis.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let hari = hari_ini();
+        let seq = self.sequence.unwrap_or(0);
+        let f = match register_untuk_jenis(&detail, type_id) {
+            Some(reg) => {
+                let id = reg.get("id").and_then(Value::as_u64);
+                let kontrak = reg.get("kontrak_id").and_then(Value::as_u64).unwrap_or(0);
+                Form::register(id, kontrak, Some(&reg), &self.jenis, None, &hari, seq)
+            }
+            None => {
+                let Some(kontrak) = kontrak_utama(&detail) else {
+                    self.status =
+                        "Pekerjaan ini belum punya kontrak. Buat kontrak dulu.".to_string();
+                    return;
+                };
+                let pref = type_id.to_string();
+                Form::register(None, kontrak, None, &self.jenis, Some(&pref), &hari, seq)
+            }
+        };
+        self.buka_form(f);
+    }
+
+    /// Formulir nomor urut terakhir tahun aktif.
+    fn open_form_sequence(&mut self) {
+        let f = Form::sequence(self.year, self.sequence.unwrap_or(0));
+        self.buka_form(f);
     }
 
     /// Register dibuat di dalam kontrak yang sedang dibuka (keputusan 2A).
@@ -406,13 +459,8 @@ impl App {
             return;
         };
         let jenis = self.lookup("jenis-dokumen", "document-types", &[]);
-        let f = Form::register(
-            None,
-            kontrak_id,
-            None,
-            form::pilihan(&jenis, &["name", "code"]),
-            &hari_ini(),
-        );
+        let seq = self.sequence.unwrap_or(0);
+        let f = Form::register(None, kontrak_id, None, &jenis, None, &hari_ini(), seq);
         self.buka_form(f);
     }
 
@@ -597,7 +645,9 @@ impl App {
         self.load();
         self.status = pesan;
         if kembali_ke_detail {
-            if let Some(id) = self
+            if self.module == Module::DocumentRegister {
+                self.segarkan_pekerjaan();
+            } else if let Some(id) = self
                 .detail
                 .as_ref()
                 .and_then(|d| d.get("id"))
@@ -611,6 +661,38 @@ impl App {
         } else {
             self.screen = Screen::List;
         }
+    }
+
+    /// Mengambil ulang pekerjaan dari daftar register (GET detail tidak memuat registers).
+    /// Dicari lewat namanya, lalu dicocokkan dengan id. Bila tidak ketemu, detail lama dipakai.
+    fn segarkan_pekerjaan(&mut self) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let Some(id) = detail.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let nama = detail
+            .get("nama_paket")
+            .and_then(scalar_text)
+            .unwrap_or_default();
+        let query = [("tahun", self.year.to_string()), ("search", nama)];
+        if let Ok(rows) = self.client.lookup("pekerjaan/document-register", &query) {
+            if let Some(baru) = rows
+                .into_iter()
+                .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+            {
+                self.detail = Some(baru);
+            }
+        }
+    }
+
+    /// Nomor urut terakhir tahun aktif dari server. `None` bila gagal.
+    fn muat_sequence(&self) -> Option<i64> {
+        self.client
+            .get_value("berita-acara/sequence", &[("year", self.year.to_string())])
+            .ok()
+            .and_then(|v| v.get("last_number").and_then(Value::as_i64))
     }
 
     // ----- Antrean offline -----
@@ -708,12 +790,38 @@ fn hari_ini() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// Nama pekerjaan induk sebuah register: `kontrak.pekerjaan.nama_paket`.
-pub fn nama_pekerjaan_register(value: &Value) -> Option<String> {
-    value
-        .pointer("/kontrak/pekerjaan/nama_paket")
-        .and_then(scalar_text)
-        .filter(|s| !s.is_empty())
+/// Register milik pekerjaan untuk satu jenis dokumen. Mencari di kontrak urut id, seperti frontend.
+/// `kontrak_id` diisi dari kontrak induk bila respons tidak memuatnya.
+pub fn register_untuk_jenis(detail: &Value, type_id: u64) -> Option<Value> {
+    let mut kontrak: Vec<&Value> = detail.get("kontrak")?.as_array()?.iter().collect();
+    kontrak.sort_by_key(|k| k.get("id").and_then(Value::as_u64).unwrap_or(0));
+    for k in kontrak {
+        let kontrak_id = k.get("id").and_then(Value::as_u64);
+        let Some(regs) = k.get("registers").and_then(Value::as_array) else {
+            continue;
+        };
+        if let Some(reg) = regs
+            .iter()
+            .find(|r| r.get("type_id").and_then(Value::as_u64) == Some(type_id))
+        {
+            let mut reg = reg.clone();
+            if let (Some(obj), Some(kid)) = (reg.as_object_mut(), kontrak_id) {
+                obj.entry("kontrak_id").or_insert(Value::from(kid));
+            }
+            return Some(reg);
+        }
+    }
+    None
+}
+
+/// Kontrak utama pekerjaan: id kontrak terkecil. `None` bila belum punya kontrak.
+pub fn kontrak_utama(detail: &Value) -> Option<u64> {
+    detail
+        .get("kontrak")?
+        .as_array()?
+        .iter()
+        .filter_map(|k| k.get("id").and_then(Value::as_u64))
+        .min()
 }
 
 /// Baris detail datar: `(label, nilai)`. Objek bersarang diberi awalan `induk.`, sampai dua tingkat.
@@ -828,10 +936,20 @@ mod tests {
     }
 
     #[test]
-    fn nama_pekerjaan_register_diambil_dari_kontrak() {
-        let reg = json!({ "id": 1, "kontrak": { "id": 3, "pekerjaan": { "id": 9, "nama_paket": "Jaringan A" } } });
-        assert_eq!(nama_pekerjaan_register(&reg).as_deref(), Some("Jaringan A"));
-        assert_eq!(nama_pekerjaan_register(&json!({ "id": 1 })), None);
+    fn register_untuk_jenis_mencari_di_kontrak_terkecil() {
+        let pekerjaan = json!({
+            "id": 1,
+            "kontrak": [
+                { "id": 9, "registers": [{ "id": 50, "type_id": 2, "nomor": "B" }] },
+                { "id": 3, "registers": [{ "id": 40, "type_id": 2, "nomor": "A", "kontrak_id": 3 }] }
+            ]
+        });
+        let reg = register_untuk_jenis(&pekerjaan, 2).unwrap();
+        assert_eq!(reg["id"], 40);
+        assert_eq!(reg["kontrak_id"], 3);
+        assert!(register_untuk_jenis(&pekerjaan, 7).is_none());
+        assert_eq!(kontrak_utama(&pekerjaan), Some(3));
+        assert_eq!(kontrak_utama(&json!({ "id": 1 })), None);
     }
 
     #[test]

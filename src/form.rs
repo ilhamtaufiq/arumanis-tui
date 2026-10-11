@@ -1,7 +1,7 @@
 //! Formulir Pekerjaan dan Register Dokumen. Logika murni tanpa I/O: isian, validasi lokal, dan body untuk API.
 //! Pilihan dropdown (kegiatan, kecamatan, desa, pengawas, jenis dokumen) diisi `App` dari lookup server.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use serde_json::{json, Map, Value};
 
 use crate::api::Module;
@@ -33,6 +33,8 @@ pub struct Field {
     pub nilai: String,
     pub pilihan: Vec<Pilihan>,
     pub galat: Option<String>,
+    /// Teks bantu di bawah isian, hanya tampilan (tidak dikirim). Dipakai untuk pratinjau nomor.
+    pub hint: Option<String>,
 }
 
 impl Field {
@@ -46,6 +48,7 @@ impl Field {
             nilai: nilai.to_string(),
             pilihan: Vec::new(),
             galat: None,
+            hint: None,
         }
     }
 
@@ -77,7 +80,7 @@ impl Field {
             }
             Kind::Pilih => json!(t),
             Kind::Angka if t.is_empty() => Value::Null,
-            Kind::Angka if self.key == "sequence_number" => {
+            Kind::Angka if matches!(self.key, "sequence_number" | "last_number") => {
                 t.parse::<i64>().map(Value::from).unwrap_or(Value::Null)
             }
             Kind::Angka => t.parse::<f64>().map(|n| json!(n)).unwrap_or(Value::Null),
@@ -99,6 +102,10 @@ pub enum Target {
         id: Option<u64>,
         kontrak_id: u64,
     },
+    /// Nomor urut terakhir per tahun (`/berita-acara/sequence`).
+    Sequence {
+        tahun: i32,
+    },
 }
 
 impl Target {
@@ -106,7 +113,7 @@ impl Target {
     pub fn modul(&self) -> &'static str {
         match self {
             Target::Pekerjaan { .. } => "pekerjaan",
-            Target::Register { .. } => "register",
+            Target::Register { .. } | Target::Sequence { .. } => "register",
         }
     }
 
@@ -117,6 +124,7 @@ impl Target {
             Target::Pekerjaan { id: Some(id) } => ("PUT", format!("pekerjaan/{id}")),
             Target::Register { id: None, .. } => ("POST", "document-registers".to_string()),
             Target::Register { id: Some(id), .. } => ("PUT", format!("document-registers/{id}")),
+            Target::Sequence { .. } => ("POST", "berita-acara/sequence".to_string()),
         }
     }
 
@@ -129,6 +137,7 @@ impl Target {
                 kontrak_id,
             } => format!("Register · baru di kontrak #{kontrak_id}"),
             Target::Register { id: Some(id), .. } => format!("Register · ubah #{id}"),
+            Target::Sequence { tahun } => format!("Sequence · {tahun}"),
         }
     }
 
@@ -145,8 +154,58 @@ impl Target {
                 kontrak_id,
             } => format!("Register baru di kontrak #{kontrak_id}"),
             Target::Register { id: Some(id), .. } => format!("Ubah register #{id}"),
+            Target::Sequence { tahun } => {
+                let last = body.get("last_number").and_then(Value::as_i64).unwrap_or(0);
+                format!("Sequence {tahun} → {last}")
+            }
         }
     }
+}
+
+/// Jenis dokumen dengan kode dan template nomor, untuk pratinjau nomor.
+#[derive(Debug, Clone)]
+pub struct Jenis {
+    pub id: String,
+    pub code: String,
+    pub template: String,
+}
+
+/// Template bawaan bila jenis dokumen belum punya `format_template`. Sama dengan frontend.
+pub const TEMPLATE_DEFAULT: &str = "{sequence}/{code}-AMIS/{month}/{year}";
+
+pub fn jenis_dari_rows(rows: &[Value]) -> Vec<Jenis> {
+    rows.iter()
+        .filter_map(|r| {
+            let id = r.get("id").and_then(scalar_text)?;
+            let code = r.get("code").and_then(scalar_text).unwrap_or_default();
+            let template = r
+                .get("format_template")
+                .and_then(scalar_text)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| TEMPLATE_DEFAULT.to_string());
+            Some(Jenis { id, code, template })
+        })
+        .collect()
+}
+
+/// Nomor dari template dengan token yang sama seperti di frontend:
+/// `{sequence}` (3 digit), `{nomor_urut_surat}`, `{code}`, `{year}`/`{tahun}`, `{month}` (romawi), `{day}`.
+pub fn pratinjau_nomor(template: &str, code: &str, tanggal: &str, seq: i64) -> Option<String> {
+    const ROMAWI: [&str; 12] = [
+        "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+    ];
+    let tgl = NaiveDate::parse_from_str(tanggal, "%Y-%m-%d").ok()?;
+    let tahun = tgl.format("%Y").to_string();
+    Some(
+        template
+            .replace("{sequence}", &format!("{seq:03}"))
+            .replace("{nomor_urut_surat}", &seq.to_string())
+            .replace("{code}", code)
+            .replace("{year}", &tahun)
+            .replace("{tahun}", &tahun)
+            .replace("{month}", ROMAWI[tgl.month0() as usize])
+            .replace("{day}", &format!("{:02}", tgl.day())),
+    )
 }
 
 /// Kunci modul antrean untuk daftar aktif. Kontrak tidak punya tulis langsung, jadi tidak ada antrean.
@@ -164,6 +223,10 @@ pub struct Form {
     pub fokus: usize,
     /// Indeks opsi yang disorot saat pemilih dropdown terbuka.
     pub pemilih: Option<usize>,
+    /// Jenis dokumen untuk pratinjau nomor (hanya register baru).
+    pub jenis: Vec<Jenis>,
+    /// Nomor urut terakhir tahun berjalan. Nomor otomatis berikutnya = ini + 1.
+    pub last_seq: i64,
 }
 
 impl Form {
@@ -260,16 +323,22 @@ impl Form {
             fields,
             fokus: 0,
             pemilih: None,
+            jenis: Vec::new(),
+            last_seq: 0,
         }
     }
 
     /// Register dokumen. `hari_ini` mengisi tanggal bila data dasar belum punya tanggal.
+    /// `jenis_rows` dari `/document-types`; `jenis_pref` memilih jenis awal saat membuat register.
+    /// `last_seq` adalah nomor urut terakhir tahun berjalan, untuk pratinjau nomor otomatis.
     pub fn register(
         id: Option<u64>,
         kontrak_id: u64,
         dasar: Option<&Value>,
-        jenis: Vec<Pilihan>,
+        jenis_rows: &[Value],
+        jenis_pref: Option<&str>,
         hari_ini: &str,
+        last_seq: i64,
     ) -> Self {
         let teks = |k: &str| {
             dasar
@@ -283,11 +352,15 @@ impl Form {
             .map(str::to_string)
             .unwrap_or_else(|| hari_ini.to_string());
 
+        let jenis_awal = match id_teks(dasar, "type_id", "type") {
+            t if t.is_empty() => jenis_pref.unwrap_or("").to_string(),
+            t => t,
+        };
         let mut type_field = Field::pilih(
             "type_id",
             "Jenis dokumen",
-            &id_teks(dasar, "type_id", "type"),
-            jenis,
+            &jenis_awal,
+            pilihan(jenis_rows, &["name", "code"]),
         );
         type_field.wajib = true;
         type_field.terkunci = id.is_some();
@@ -300,7 +373,14 @@ impl Form {
         let mut fields = vec![
             type_field,
             Field::new("tanggal", "Tanggal", Kind::Tanggal, true, &tanggal),
-            Field::new("nomor", nomor_label, Kind::Teks, false, &teks("nomor")),
+            // Saat mengubah, nomor wajib diisi (aturan server).
+            Field::new(
+                "nomor",
+                nomor_label,
+                Kind::Teks,
+                id.is_some(),
+                &teks("nomor"),
+            ),
             Field::new(
                 "description",
                 "Keterangan",
@@ -318,11 +398,53 @@ impl Form {
                 "",
             ));
         }
-        Self {
+        let mut form = Self {
             target: Target::Register { id, kontrak_id },
             fields,
             fokus: 0,
             pemilih: None,
+            jenis: jenis_dari_rows(jenis_rows),
+            last_seq,
+        };
+        form.perbarui_pratinjau();
+        form
+    }
+
+    /// Formulir nomor urut terakhir untuk tahun tertentu.
+    pub fn sequence(tahun: i32, terakhir: i64) -> Self {
+        Self {
+            target: Target::Sequence { tahun },
+            fields: vec![Field::new(
+                "last_number",
+                "Nomor urut terakhir",
+                Kind::Angka,
+                true,
+                &terakhir.to_string(),
+            )],
+            fokus: 0,
+            pemilih: None,
+            jenis: Vec::new(),
+            last_seq: terakhir,
+        }
+    }
+
+    /// Pratinjau nomor di bawah isian nomor, saat membuat register. Mengikuti jenis, tanggal, dan sequence.
+    pub fn perbarui_pratinjau(&mut self) {
+        if !matches!(self.target, Target::Register { id: None, .. }) {
+            return;
+        }
+        let jenis_id = self.nilai("type_id").to_string();
+        let tanggal = self.nilai("tanggal").to_string();
+        let manual = self.nilai("sequence_number").trim().parse::<i64>().ok();
+        let seq = manual.unwrap_or(self.last_seq + 1);
+        let hint = self
+            .jenis
+            .iter()
+            .find(|j| j.id == jenis_id)
+            .and_then(|j| pratinjau_nomor(&j.template, &j.code, &tanggal, seq))
+            .map(|n| format!("Pratinjau: {n}"));
+        if let Some(f) = self.fields.iter_mut().find(|f| f.key == "nomor") {
+            f.hint = hint;
         }
     }
 
@@ -358,6 +480,7 @@ impl Form {
             f.nilai.push(c);
             f.galat = None;
         }
+        self.perbarui_pratinjau();
     }
 
     pub fn hapus(&mut self) {
@@ -367,6 +490,7 @@ impl Form {
         }
         f.nilai.pop();
         f.galat = None;
+        self.perbarui_pratinjau();
     }
 
     pub fn centang(&mut self) {
@@ -395,6 +519,7 @@ impl Form {
         f.nilai = nilai;
         f.galat = None;
         self.pemilih = None;
+        self.perbarui_pratinjau();
     }
 
     /// Mengganti opsi dropdown. Nilai terpilih dikosongkan bila tidak ada lagi di daftar baru.
@@ -442,6 +567,9 @@ impl Form {
         let mut m = Map::new();
         for f in &self.fields {
             m.insert(f.key.to_string(), f.ke_json());
+        }
+        if let Target::Sequence { tahun } = &self.target {
+            m.insert("year".to_string(), json!(tahun));
         }
         if let Target::Register { id, kontrak_id } = &self.target {
             match id {
@@ -586,7 +714,7 @@ mod tests {
             "description": null,
             "kontrak_id": 7
         });
-        let f = Form::register(Some(5), 7, Some(&dasar), vec![], "2026-01-01");
+        let f = Form::register(Some(5), 7, Some(&dasar), &[], None, "2026-01-01", 0);
         let b = f.ke_body();
         assert!(b.get("type_id").is_none());
         assert!(b.get("kontrak_id").is_none());
@@ -601,11 +729,8 @@ mod tests {
 
     #[test]
     fn register_baru_menyertakan_kontrak_dan_membuang_nomor_kosong() {
-        let jenis = pilihan(
-            &[json!({ "id": 2, "name": "Surat", "code": "SRT" })],
-            &["name", "code"],
-        );
-        let mut f = Form::register(None, 7, None, jenis, "2026-01-01");
+        let jenis = [json!({ "id": 2, "name": "Surat", "code": "SRT" })];
+        let mut f = Form::register(None, 7, None, &jenis, None, "2026-01-01", 0);
         isi(&mut f, "type_id", "2");
         let b = f.ke_body();
         assert_eq!(b["kontrak_id"], 7);
@@ -621,7 +746,7 @@ mod tests {
 
     #[test]
     fn validasi_tanggal_dan_galat_server_ditempel_ke_isian() {
-        let mut f = Form::register(None, 7, None, vec![], "2026-01-01");
+        let mut f = Form::register(None, 7, None, &[], None, "2026-01-01", 0);
         isi(&mut f, "type_id", "2");
         isi(&mut f, "tanggal", "01-02-2026");
         assert!(!f.validasi());
@@ -636,7 +761,7 @@ mod tests {
 
     #[test]
     fn ketik_menolak_karakter_sesuai_jenis_isian() {
-        let mut f = Form::register(None, 7, None, vec![], "2026-01-01");
+        let mut f = Form::register(None, 7, None, &[], None, "2026-01-01", 0);
         f.fokus = 1; // tanggal
         f.ketik('a');
         assert_eq!(f.fields[1].nilai, "2026-01-01", "huruf ditolak");
@@ -658,5 +783,62 @@ mod tests {
         );
         assert_eq!(p[0], (String::new(), KOSONG.to_string()));
         assert_eq!(p[1], ("4".to_string(), "Cianjur".to_string()));
+    }
+
+    #[test]
+    fn pratinjau_nomor_mengikuti_token_frontend() {
+        let t = "{sequence}/{code}-AMIS/{month}/{year}";
+        assert_eq!(
+            pratinjau_nomor(t, "SRT", "2026-05-03", 7).as_deref(),
+            Some("007/SRT-AMIS/V/2026")
+        );
+        assert_eq!(
+            pratinjau_nomor("{nomor_urut_surat}-{day}-{tahun}", "X", "2026-12-09", 12).as_deref(),
+            Some("12-09-2026")
+        );
+        assert_eq!(pratinjau_nomor(t, "SRT", "tanggal-salah", 1), None);
+    }
+
+    #[test]
+    fn pratinjau_mengikuti_jenis_dan_sequence_manual() {
+        let jenis = [
+            json!({ "id": 2, "name": "Surat", "code": "SRT", "format_template": "{sequence}/{code}/{year}" }),
+        ];
+        let mut f = Form::register(None, 7, None, &jenis, Some("2"), "2026-05-03", 41);
+        let hint = |f: &Form| {
+            f.fields
+                .iter()
+                .find(|x| x.key == "nomor")
+                .unwrap()
+                .hint
+                .clone()
+        };
+        assert_eq!(hint(&f).as_deref(), Some("Pratinjau: 042/SRT/2026"));
+        isi(&mut f, "sequence_number", "9");
+        f.perbarui_pratinjau();
+        assert_eq!(hint(&f).as_deref(), Some("Pratinjau: 009/SRT/2026"));
+    }
+
+    #[test]
+    fn nomor_wajib_saat_mengubah_register() {
+        let dasar = json!({ "id": 5, "type_id": 2, "tanggal": "2026-03-04", "nomor": "" });
+        let mut f = Form::register(Some(5), 7, Some(&dasar), &[], None, "2026-01-01", 0);
+        assert!(!f.validasi());
+        let nomor = f.fields.iter().find(|x| x.key == "nomor").unwrap();
+        assert_eq!(nomor.galat.as_deref(), Some("Wajib diisi."));
+    }
+
+    #[test]
+    fn body_sequence_mengirim_tahun_dan_nomor_bulat() {
+        let mut f = Form::sequence(2026, 41);
+        isi(&mut f, "last_number", "45");
+        assert!(f.validasi());
+        let b = f.ke_body();
+        assert_eq!(b["year"], 2026);
+        assert_eq!(b["last_number"], 45);
+        assert_eq!(
+            f.target.tujuan(),
+            ("POST", "berita-acara/sequence".to_string())
+        );
     }
 }

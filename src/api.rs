@@ -37,15 +37,15 @@ impl Module {
         match self {
             Module::Pekerjaan => "pekerjaan",
             Module::Kontrak => "kontrak",
-            Module::DocumentRegister => "document-registers",
+            // Register dimuat per pekerjaan, sama dengan halaman Register di frontend.
+            Module::DocumentRegister => "pekerjaan/document-register",
         }
     }
 
     /// Nama parameter filter tahun anggaran di API. Pekerjaan memfilter lewat kegiatan induknya.
     pub fn year_param(self) -> &'static str {
         match self {
-            Module::DocumentRegister => "year",
-            Module::Pekerjaan | Module::Kontrak => "tahun",
+            Module::Pekerjaan | Module::Kontrak | Module::DocumentRegister => "tahun",
         }
     }
 
@@ -54,7 +54,7 @@ impl Module {
         match self {
             Module::Pekerjaan => &["nama_paket", "kode_rekening"],
             Module::Kontrak => &["nomor", "spk", "kode_paket"],
-            Module::DocumentRegister => &["name", "nomor", "code"],
+            Module::DocumentRegister => &["nama_paket", "kode_rekening"],
         }
     }
 }
@@ -204,6 +204,12 @@ impl Client {
                 _ => return Ok(rows),
             }
         }
+    }
+
+    /// GET satu objek JSON (bukan daftar), mis. `berita-acara/sequence`.
+    pub fn get_value(&self, path: &str, query: &[(&str, String)]) -> Result<Value, ApiError> {
+        let req = self.auth(self.http.get(self.url(path)))?.query(query);
+        check(req.send().map_err(ApiError::network)?)
     }
 
     /// Kirim body JSON dengan POST atau PUT. Mengembalikan isi `data` bila ada.
