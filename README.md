@@ -41,5 +41,5 @@ APIAMIS_TEST_URL=... APIAMIS_TEST_EMAIL=... APIAMIS_TEST_PASSWORD=... cargo test
 
 ## Batasan
 
-- Belum ada foto bukti, pengaturan RHK, atau export PPTX.
+- Di luar cakupan TUI: foto bukti, pengaturan RHK, dan export PPTX. Fitur itu tetap di aplikasi web.
 - Panggilan API bersifat blocking. Saat jaringan lambat, layar bisa tertahan sebentar.
