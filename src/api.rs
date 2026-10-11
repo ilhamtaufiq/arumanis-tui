@@ -111,6 +111,16 @@ impl Client {
         })
     }
 
+    /// Token login yang sedang dipakai, untuk disimpan sebagai sesi offline.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// Memakai token dari sesi offline yang sudah dibuka.
+    pub fn pakai_token(&mut self, token: String) {
+        self.token = Some(token);
+    }
+
     pub fn login(&mut self, email: &str, password: &str) -> Result<(), ApiError> {
         let resp = self
             .http

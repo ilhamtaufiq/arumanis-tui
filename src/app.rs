@@ -8,6 +8,7 @@ use crate::api::{Client, Module};
 use crate::cache;
 use crate::form::{self, Form, Kind};
 use crate::queue::{self, Pending};
+use crate::session::{self, Galat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -124,16 +125,60 @@ impl App {
         }
         let email = self.email.trim().to_string();
         let password = self.password.clone();
+        let sekarang = chrono::Utc::now().timestamp();
         match self.client.login(&email, &password) {
             Ok(()) => {
+                // Simpan sesi terenkripsi agar bisa dibuka offline. Gagal menyimpan tidak menggagalkan login.
+                let simpan = match self.client.token() {
+                    Some(token) => session::simpan(&email, &password, token, sekarang),
+                    None => Ok(()),
+                };
                 self.password.clear();
                 self.screen = Screen::Menu;
                 self.menu_idx = 0;
-                self.status = format!("Masuk sebagai {email}.");
+                self.status = match simpan {
+                    Ok(()) => format!("Masuk sebagai {email}."),
+                    Err(err) => {
+                        format!("Masuk sebagai {email}, tapi sesi offline gagal disimpan: {err:?}")
+                    }
+                };
                 if !self.antrean.is_empty() {
                     self.sinkron();
                 }
             }
+            // Status 0 = tidak ada koneksi: coba sesi offline yang tersimpan di perangkat ini.
+            Err(e) if e.status == 0 => match session::buka(&email, &password, sekarang) {
+                Ok(sesi) => {
+                    self.client.pakai_token(sesi.token);
+                    self.password.clear();
+                    self.screen = Screen::Menu;
+                    self.menu_idx = 0;
+                    self.status = format!(
+                        "Masuk offline sebagai {email}. Sesi berlaku sampai {}. Data dari cache; perubahan masuk antrean.",
+                        cache::format_time(sesi.berakhir)
+                    );
+                }
+                Err(Galat::PasswordSalah) => {
+                    self.status =
+                        "Tidak ada koneksi, dan password tidak cocok dengan sesi di perangkat ini."
+                            .to_string();
+                }
+                Err(Galat::AkunBeda) => {
+                    self.status = "Tidak ada koneksi. Perangkat ini menyimpan sesi akun lain; hubungkan ke internet untuk masuk.".to_string();
+                }
+                Err(Galat::Kedaluwarsa) => {
+                    self.status =
+                        "Sesi offline sudah kedaluwarsa. Hubungkan ke internet untuk masuk."
+                            .to_string();
+                }
+                Err(Galat::Kosong) => {
+                    self.status =
+                        "Tidak ada koneksi, dan belum pernah masuk di perangkat ini.".to_string();
+                }
+                Err(Galat::Io(m)) => {
+                    self.status = format!("Tidak ada koneksi, dan sesi offline gagal dibaca: {m}");
+                }
+            },
             Err(e) => self.status = format!("Login gagal: {e}"),
         }
     }
@@ -351,6 +396,8 @@ impl App {
 
     /// Mencabut token di server, lalu kembali ke layar login.
     fn logout(&mut self) {
+        // Sesi offline ikut dihapus: keluar berarti perangkat ini tidak lagi menyimpan token.
+        session::hapus();
         let result = self.client.logout();
         self.rows.clear();
         self.detail = None;
