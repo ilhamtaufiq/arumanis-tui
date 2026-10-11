@@ -1,11 +1,13 @@
-//! State aplikasi dan penanganan tombol. Tidak ada I/O di sini kecuali lewat `Client`.
+//! State aplikasi dan penanganan tombol. I/O hanya lewat `Client`, cache baca, dan antrean tulis.
 
 use chrono::Datelike;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use crate::api::{Client, Module};
 use crate::cache;
+use crate::form::{self, Form, Kind};
+use crate::queue::{self, Pending};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -13,6 +15,7 @@ pub enum Screen {
     Menu,
     List,
     Detail,
+    Form,
 }
 
 pub struct App {
@@ -37,6 +40,11 @@ pub struct App {
     pub rows: Vec<Value>,
     pub selected: usize,
     pub detail: Option<Value>,
+    pub form: Option<Form>,
+    /// Layar tempat formulir dibuka, untuk kembali setelah simpan atau batal.
+    pub form_back: Screen,
+    /// Perubahan yang menunggu dikirim: offline, atau gagal saat sinkron.
+    pub antrean: Vec<Pending>,
     pub status: String,
     pub should_quit: bool,
 }
@@ -60,6 +68,9 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             detail: None,
+            form: None,
+            form_back: Screen::List,
+            antrean: queue::load(),
             status: "Masuk dengan akun Arumanis.".to_string(),
             should_quit: false,
         }
@@ -71,6 +82,7 @@ impl App {
             Screen::Menu => self.key_menu(key.code),
             Screen::List => self.key_list(key.code),
             Screen::Detail => self.key_detail(key.code),
+            Screen::Form => self.key_form(key),
         }
     }
 
@@ -110,6 +122,9 @@ impl App {
                 self.screen = Screen::Menu;
                 self.menu_idx = 0;
                 self.status = format!("Masuk sebagai {email}.");
+                if !self.antrean.is_empty() {
+                    self.sinkron();
+                }
             }
             Err(e) => self.status = format!("Login gagal: {e}"),
         }
@@ -144,7 +159,10 @@ impl App {
 
     /// Muat halaman daftar aktif. Error ditampilkan di status bar, layar tetap.
     pub fn load(&mut self) {
-        match self.client.list(self.module, self.page, &self.search, self.year) {
+        match self
+            .client
+            .list(self.module, self.page, &self.search, self.year)
+        {
             Ok(rows) => {
                 cache::save(self.module, self.year, self.page, &self.search, &rows);
                 self.cached_at = None;
@@ -152,18 +170,23 @@ impl App {
                 self.rows = rows;
             }
             // Status 0 = tidak ada koneksi. Tampilkan cache terakhir bila ada.
-            Err(e) if e.status == 0 => match cache::load(self.module, self.year, self.page, &self.search) {
-                Some((rows, saved_at)) => {
-                    self.status = format!("Offline. Data dari cache tersimpan {}.", cache::format_time(saved_at));
-                    self.cached_at = Some(saved_at);
-                    self.rows = rows;
+            Err(e) if e.status == 0 => {
+                match cache::load(self.module, self.year, self.page, &self.search) {
+                    Some((rows, saved_at)) => {
+                        self.status = format!(
+                            "Offline. Data dari cache tersimpan {}.",
+                            cache::format_time(saved_at)
+                        );
+                        self.cached_at = Some(saved_at);
+                        self.rows = rows;
+                    }
+                    None => {
+                        self.rows.clear();
+                        self.cached_at = None;
+                        self.status = "Offline dan belum ada cache untuk daftar ini.".to_string();
+                    }
                 }
-                None => {
-                    self.rows.clear();
-                    self.cached_at = None;
-                    self.status = "Offline dan belum ada cache untuk daftar ini.".to_string();
-                }
-            },
+            }
             Err(e) => {
                 self.status = format!("Gagal memuat daftar: {e}");
                 if e.status == 401 {
@@ -247,6 +270,11 @@ impl App {
                 let options = cache::year_options(chrono::Local::now().year());
                 self.year_menu = options.iter().position(|y| *y == self.year).or(Some(0));
             }
+            KeyCode::Char('n') if self.module == Module::Pekerjaan => {
+                self.open_form_pekerjaan(None)
+            }
+            KeyCode::Char('s') => self.sinkron(),
+            KeyCode::Char('x') => self.buang_ditolak(),
             KeyCode::Enter => self.open_detail(),
             _ => {}
         }
@@ -265,14 +293,25 @@ impl App {
                 self.detail = Some(v);
                 self.screen = Screen::Detail;
             }
+            // Offline: detail diambil dari baris daftar yang sudah ada.
+            Err(e) if e.status == 0 => {
+                self.detail = Some(row.clone());
+                self.screen = Screen::Detail;
+                self.status = "Offline: menampilkan data dari daftar.".to_string();
+            }
             Err(e) => self.status = format!("Gagal membuka detail: {e}"),
         }
     }
 
     fn key_detail(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace) {
-            self.detail = None;
-            self.screen = Screen::List;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+                self.detail = None;
+                self.screen = Screen::List;
+            }
+            KeyCode::Char('e') if self.module != Module::Kontrak => self.open_form_ubah(),
+            KeyCode::Char('n') if self.module == Module::Kontrak => self.open_form_register_baru(),
+            _ => {}
         }
     }
 
@@ -288,6 +327,355 @@ impl App {
             Ok(()) => "Anda sudah keluar.".to_string(),
             Err(e) => format!("Keluar lokal saja, server menolak: {e}"),
         };
+    }
+
+    // ----- Formulir -----
+
+    fn open_form_pekerjaan(&mut self, id: Option<u64>) {
+        let dasar = if id.is_some() {
+            self.detail.clone()
+        } else {
+            None
+        };
+        let tahun = self.year;
+        let kegiatan = self.lookup(
+            &format!("kegiatan-{tahun}"),
+            "kegiatan",
+            &[("tahun", tahun.to_string())],
+        );
+        let kecamatan = self.lookup("kecamatan", "kecamatan", &[]);
+        let kec = form::id_teks(dasar.as_ref(), "kecamatan_id", "kecamatan");
+        let desa = self.muat_desa(&kec);
+        let pengawas = self.lookup("pengawas", "pengawas", &[]);
+        let f = Form::pekerjaan(
+            id,
+            dasar.as_ref(),
+            form::pilihan(&kegiatan, &["nama_kegiatan", "nama_sub_kegiatan"]),
+            form::pilihan(&kecamatan, &["nama_kecamatan"]),
+            form::pilihan(&desa, &["nama_desa"]),
+            form::pilihan(&pengawas, &["nama"]),
+        );
+        self.buka_form(f);
+    }
+
+    fn open_form_ubah(&mut self) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        let Some(id) = detail.get("id").and_then(Value::as_u64) else {
+            self.status = "Data ini tidak punya id.".to_string();
+            return;
+        };
+        match self.module {
+            Module::Pekerjaan => self.open_form_pekerjaan(Some(id)),
+            Module::DocumentRegister => {
+                let kontrak_id = detail
+                    .get("kontrak_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let jenis = self.lookup("jenis-dokumen", "document-types", &[]);
+                let f = Form::register(
+                    Some(id),
+                    kontrak_id,
+                    Some(&detail),
+                    form::pilihan(&jenis, &["name", "code"]),
+                    &hari_ini(),
+                );
+                self.buka_form(f);
+            }
+            Module::Kontrak => {}
+        }
+    }
+
+    /// Register dibuat di dalam kontrak yang sedang dibuka (keputusan 2A).
+    fn open_form_register_baru(&mut self) {
+        let Some(kontrak_id) = self
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("id"))
+            .and_then(Value::as_u64)
+        else {
+            self.status = "Kontrak ini tidak punya id.".to_string();
+            return;
+        };
+        let jenis = self.lookup("jenis-dokumen", "document-types", &[]);
+        let f = Form::register(
+            None,
+            kontrak_id,
+            None,
+            form::pilihan(&jenis, &["name", "code"]),
+            &hari_ini(),
+        );
+        self.buka_form(f);
+    }
+
+    fn buka_form(&mut self, f: Form) {
+        self.form_back = self.screen;
+        self.form = Some(f);
+        self.screen = Screen::Form;
+        self.status = "Isi formulir. Ctrl+S simpan, Esc batal.".to_string();
+    }
+
+    /// Lookup dari server. Bila gagal, pakai cache terakhir dan beri tahu di status bar.
+    fn lookup(&mut self, nama: &str, path: &str, query: &[(&str, String)]) -> Vec<Value> {
+        match self.client.lookup(path, query) {
+            Ok(rows) => {
+                cache::save_named(nama, &rows);
+                rows
+            }
+            Err(e) => match cache::load_named(nama) {
+                Some((rows, saved_at)) => {
+                    self.status = format!(
+                        "Lookup {nama} dari cache {}: {e}",
+                        cache::format_time(saved_at)
+                    );
+                    rows
+                }
+                None => {
+                    self.status = format!("Gagal memuat {nama}: {e}");
+                    Vec::new()
+                }
+            },
+        }
+    }
+
+    fn muat_desa(&mut self, kecamatan_id: &str) -> Vec<Value> {
+        if kecamatan_id.is_empty() {
+            return Vec::new();
+        }
+        let path = format!("desa/kecamatan/{kecamatan_id}");
+        self.lookup(&format!("desa-{kecamatan_id}"), &path, &[])
+    }
+
+    fn key_form(&mut self, key: KeyEvent) {
+        if self.form.as_ref().is_some_and(|f| f.pemilih.is_some()) {
+            self.key_pemilih(key.code);
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.batal_form();
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('s') {
+            self.simpan_form();
+            return;
+        }
+        let Some(form) = self.form.as_mut() else {
+            self.screen = self.form_back;
+            return;
+        };
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => form.geser_fokus(1),
+            KeyCode::BackTab | KeyCode::Up => form.geser_fokus(-1),
+            KeyCode::Enter => match form.fokus_field().kind {
+                Kind::Pilih => form.buka_pemilih(),
+                Kind::Centang => form.centang(),
+                _ => form.geser_fokus(1),
+            },
+            KeyCode::Char(' ') if form.fokus_field().kind == Kind::Centang => form.centang(),
+            KeyCode::Backspace => form.hapus(),
+            KeyCode::Char(c) if !ctrl => form.ketik(c),
+            _ => {}
+        }
+    }
+
+    fn key_pemilih(&mut self, code: KeyCode) {
+        let mut ganti_kecamatan = false;
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(idx) = form.pemilih else {
+            return;
+        };
+        let jumlah = form.fokus_field().pilihan.len();
+        match code {
+            KeyCode::Esc => form.pemilih = None,
+            KeyCode::Up => form.pemilih = Some(idx.saturating_sub(1)),
+            KeyCode::Down => form.pemilih = Some((idx + 1).min(jumlah.saturating_sub(1))),
+            KeyCode::Enter => {
+                if let Some((nilai, _)) = form.fokus_field().pilihan.get(idx).cloned() {
+                    ganti_kecamatan = form.fokus_field().key == "kecamatan_id";
+                    form.pilih_nilai(nilai);
+                }
+            }
+            _ => {}
+        }
+        if ganti_kecamatan {
+            self.ganti_kecamatan();
+        }
+    }
+
+    /// Dropdown desa mengikuti kecamatan yang dipilih.
+    fn ganti_kecamatan(&mut self) {
+        let kec = self
+            .form
+            .as_ref()
+            .map(|f| f.nilai("kecamatan_id").to_string())
+            .unwrap_or_default();
+        let desa = self.muat_desa(&kec);
+        if let Some(form) = self.form.as_mut() {
+            form.set_pilihan("desa_id", form::pilihan(&desa, &["nama_desa"]));
+        }
+    }
+
+    fn simpan_form(&mut self) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        if !form.validasi() {
+            self.status = "Periksa isian yang bertanda merah.".to_string();
+            return;
+        }
+        let (metode, path) = form.target.tujuan();
+        let body = form.ke_body();
+        let label = form.target.label(&body);
+        let modul = form.target.modul();
+
+        match self.client.kirim(metode, &path, &body) {
+            Ok(_) => {
+                self.form = None;
+                self.status = "Tersimpan.".to_string();
+                self.setelah_simpan();
+            }
+            // Status 0 = tidak ada koneksi: simpan di antrean dan kirim saat online.
+            Err(e) if e.status == 0 => {
+                self.form = None;
+                let item = Pending {
+                    id: self.baru_id(),
+                    modul: modul.to_string(),
+                    metode: metode.to_string(),
+                    path,
+                    body,
+                    label,
+                    dibuat: chrono::Utc::now().timestamp(),
+                    galat: None,
+                };
+                self.antrean.push(item);
+                self.status = match queue::save(&self.antrean) {
+                    Ok(()) => "Tidak ada koneksi. Disimpan di antrean; tekan s saat online untuk mengirim.".to_string(),
+                    Err(err) => format!("Tidak ada koneksi dan antrean gagal ditulis: {err}"),
+                };
+                self.setelah_simpan();
+            }
+            Err(e) if e.status == 401 => {
+                self.form = None;
+                self.screen = Screen::Login;
+                self.status = "Sesi habis. Masuk lagi.".to_string();
+            }
+            Err(e) => {
+                let sisa = self
+                    .form
+                    .as_mut()
+                    .map(|f| f.terapkan_galat(&e.errors))
+                    .unwrap_or_default();
+                self.status = format!(
+                    "Gagal menyimpan: {}",
+                    if sisa.is_empty() { e.to_string() } else { sisa }
+                );
+            }
+        }
+    }
+
+    fn batal_form(&mut self) {
+        self.form = None;
+        self.screen = self.form_back;
+        self.status = "Formulir ditutup tanpa menyimpan.".to_string();
+    }
+
+    /// Setelah simpan: muat ulang daftar, lalu kembali ke detail (bila dari detail) atau daftar.
+    fn setelah_simpan(&mut self) {
+        let pesan = self.status.clone();
+        let kembali_ke_detail = self.form_back == Screen::Detail;
+        self.load();
+        self.status = pesan;
+        if kembali_ke_detail {
+            if let Some(id) = self
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("id"))
+                .and_then(Value::as_u64)
+            {
+                if let Ok(v) = self.client.detail(self.module, id) {
+                    self.detail = Some(v);
+                }
+            }
+            self.screen = Screen::Detail;
+        } else {
+            self.screen = Screen::List;
+        }
+    }
+
+    // ----- Antrean offline -----
+
+    /// Kirim seluruh antrean sesuai urutan. Berhenti saat tidak ada koneksi atau sesi habis.
+    /// Penolakan server ditandai di antrean dan bisa dibuang dengan x.
+    pub fn sinkron(&mut self) {
+        if self.antrean.is_empty() {
+            self.status = "Tidak ada perubahan yang menunggu.".to_string();
+            return;
+        }
+        let semua = std::mem::take(&mut self.antrean);
+        let total = semua.len();
+        let mut sisa: Vec<Pending> = Vec::new();
+        let mut alasan: Option<&str> = None;
+        for mut p in semua {
+            if alasan.is_some() {
+                sisa.push(p);
+                continue;
+            }
+            match self.client.kirim(&p.metode, &p.path, &p.body) {
+                Ok(_) => {}
+                Err(e) if e.status == 0 => {
+                    alasan = Some("tidak ada koneksi");
+                    sisa.push(p);
+                }
+                Err(e) if e.status == 401 => {
+                    alasan = Some("sesi habis, masuk lagi lalu tekan s");
+                    sisa.push(p);
+                }
+                Err(e) => {
+                    p.galat = Some(e.to_string());
+                    sisa.push(p);
+                }
+            }
+        }
+        let terkirim = total - sisa.len();
+        let tersisa = sisa.len();
+        self.antrean = sisa;
+        let tulis = queue::save(&self.antrean);
+        self.status = match (tulis, alasan) {
+            (Err(err), _) => format!("Gagal menulis antrean: {err}"),
+            (Ok(()), Some(a)) => format!("{terkirim} terkirim, {tersisa} masih di antrean ({a})."),
+            (Ok(()), None) => format!("{terkirim} terkirim, {tersisa} ditolak atau tertunda."),
+        };
+    }
+
+    /// Membuang perubahan yang ditolak server di modul aktif.
+    fn buang_ditolak(&mut self) {
+        let modul = form::modul_antrean(self.module);
+        let sebelum = self.antrean.len();
+        self.antrean
+            .retain(|p| !(p.modul == modul && p.galat.is_some()));
+        let dibuang = sebelum - self.antrean.len();
+        if dibuang == 0 {
+            self.status = "Tidak ada perubahan yang ditolak server di modul ini.".to_string();
+            return;
+        }
+        self.status = match queue::save(&self.antrean) {
+            Ok(()) => format!("{dibuang} perubahan yang ditolak server dibuang."),
+            Err(err) => format!("Gagal menulis antrean: {err}"),
+        };
+    }
+
+    /// Perubahan antrean untuk modul yang sedang tampil.
+    pub fn antrean_modul(&self) -> Vec<&Pending> {
+        let kunci = form::modul_antrean(self.module);
+        self.antrean.iter().filter(|p| p.modul == kunci).collect()
+    }
+
+    fn baru_id(&self) -> u64 {
+        chrono::Utc::now().timestamp_millis().max(0) as u64 + self.antrean.len() as u64
     }
 
     /// Label singkat sebuah baris untuk daftar, dari kunci yang tersedia.
@@ -309,6 +697,10 @@ impl App {
     }
 }
 
+fn hari_ini() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// Baris detail datar: `(label, nilai)`. Objek bersarang diberi awalan `induk.`, sampai dua tingkat.
 /// Daftar ditampilkan sebagai jumlah lalu satu baris per item (maks 10), dengan teks dari kunci judul.
 pub fn detail_rows(value: &Value) -> Vec<(String, String)> {
@@ -319,7 +711,10 @@ pub fn detail_rows(value: &Value) -> Vec<(String, String)> {
 
 fn push_rows(value: &Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
     let Some(obj) = value.as_object() else {
-        out.push((prefix.trim_end_matches('.').to_string(), scalar_text(value).unwrap_or_default()));
+        out.push((
+            prefix.trim_end_matches('.').to_string(),
+            scalar_text(value).unwrap_or_default(),
+        ));
         return;
     };
     let mut keys: Vec<&String> = obj.keys().collect();
@@ -335,7 +730,10 @@ fn push_rows(value: &Value, prefix: &str, depth: usize, out: &mut Vec<(String, S
                     out.push((format!("  {label}"), item_title(item)));
                 }
                 if items.len() > 10 {
-                    out.push((format!("  {label}"), format!("…dan {} lagi", items.len() - 10)));
+                    out.push((
+                        format!("  {label}"),
+                        format!("…dan {} lagi", items.len() - 10),
+                    ));
                 }
             }
             Value::Object(_) => out.push((label, "(objek)".to_string())),
@@ -408,7 +806,9 @@ mod tests {
         assert_eq!(get("nomor").as_deref(), Some("K-1"));
         assert_eq!(get("penyedia.nama").as_deref(), Some("CV Air"));
         assert_eq!(get("pekerjaan").as_deref(), Some("2 item"));
-        assert!(rows.iter().any(|(l, v)| l == "  pekerjaan" && v == "Jaringan A"));
+        assert!(rows
+            .iter()
+            .any(|(l, v)| l == "  pekerjaan" && v == "Jaringan A"));
         assert!(rows.iter().any(|(l, v)| l == "  pekerjaan" && v == "#10"));
     }
 

@@ -1,10 +1,10 @@
 //! Tampilan ratatui. Hanya membaca `App`, tidak mengubah state.
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -12,8 +12,15 @@ use chrono::Datelike;
 
 use crate::api::Module;
 use crate::app::{detail_rows, App, Screen};
+use crate::form::{Form, Kind};
 
 const ACCENT: Color = Color::Rgb(0x0B, 0x3B, 0x78);
+const ACCENT_SOFT: Color = Color::Rgb(0x7F, 0xA7, 0xD9);
+const OK: Color = Color::Rgb(0x2E, 0x9E, 0x5B);
+const WARN: Color = Color::Rgb(0xD9, 0x8E, 0x04);
+const ERR: Color = Color::Rgb(0xC6, 0x28, 0x28);
+const MUTED: Color = Color::Rgb(0x6B, 0x72, 0x80);
+const SELECT_BG: Color = Color::Rgb(0x1F, 0x4E, 0x8C);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let [header, body, help, status] = Layout::vertical([
@@ -24,110 +31,300 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    let title = match app.screen {
-        Screen::Login => "Arumanis · Masuk".to_string(),
-        Screen::Menu => "Arumanis · Menu".to_string(),
-        Screen::List => format!("Arumanis · {}", app.module.title()),
-        Screen::Detail => format!("Arumanis · {} · detail", app.module.title()),
-    };
-    frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(Color::White).bg(ACCENT).add_modifier(Modifier::BOLD)),
-        header,
-    );
+    draw_header(frame, app, header);
 
+    let area = body.inner(Margin::new(1, 0));
     match app.screen {
-        Screen::Login => draw_login(frame, app, body),
-        Screen::Menu => draw_menu(frame, app, body),
-        Screen::List => draw_list(frame, app, body),
-        Screen::Detail => draw_detail(frame, app, body),
+        Screen::Login => draw_login(frame, app, area),
+        Screen::Menu => draw_menu(frame, app, area),
+        Screen::List => draw_list(frame, app, area),
+        Screen::Detail => draw_detail(frame, app, area),
+        Screen::Form => draw_form(frame, app, area),
     }
 
+    draw_help(frame, &help_pairs(app), help);
+    draw_status(frame, &app.status, status);
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let crumb = match app.screen {
+        Screen::Login => "Masuk".to_string(),
+        Screen::Menu => "Menu".to_string(),
+        Screen::List => format!("{} · {}", app.module.title(), app.year),
+        Screen::Detail => format!("{} · detail", app.module.title()),
+        Screen::Form => app
+            .form
+            .as_ref()
+            .map(|f| f.target.judul())
+            .unwrap_or_default(),
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            " ◆ ARUMANIS ",
+            Style::default()
+                .fg(Color::White)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {crumb} "),
+            Style::default().fg(Color::White).bg(SELECT_BG),
+        ),
+    ]);
     frame.render_widget(
-        Paragraph::new(format!(" {}", help_line(app))).style(Style::default().fg(Color::DarkGray)),
-        help,
-    );
-    frame.render_widget(
-        Paragraph::new(format!(" {}", app.status)).style(Style::default().fg(Color::Gray)),
-        status,
+        Paragraph::new(line).style(Style::default().bg(ACCENT)),
+        area,
     );
 }
 
-fn help_line(app: &App) -> &'static str {
+/// Pasangan (tombol, keterangan) untuk bilah bantuan di bawah layar.
+fn help_pairs(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.screen {
-        Screen::Login => "Tab ganti kolom · Enter masuk · Esc keluar",
-        Screen::Menu => "↑/↓ pilih · Enter buka · l keluar · q keluar aplikasi",
-        Screen::List if app.searching => "Ketik kata kunci · Enter cari · Esc batal",
-        Screen::List if app.year_menu.is_some() => "↑/↓ pilih tahun · Enter terapkan · Esc batal",
-        Screen::List => "↑/↓ pilih · Enter detail · / cari · t tahun · ←/→ halaman · r muat ulang · Esc kembali",
-        Screen::Detail => "Esc atau Backspace kembali",
+        Screen::Login => vec![("Tab", "pindah"), ("Enter", "masuk"), ("Esc", "keluar")],
+        Screen::Menu => vec![
+            ("↑↓", "pilih"),
+            ("Enter", "buka"),
+            ("l", "keluar"),
+            ("q", "tutup"),
+        ],
+        Screen::List if app.searching => {
+            vec![("ketik", "cari"), ("Enter", "terapkan"), ("Esc", "batal")]
+        }
+        Screen::List if app.year_menu.is_some() => vec![
+            ("↑↓", "pilih tahun"),
+            ("Enter", "terapkan"),
+            ("Esc", "batal"),
+        ],
+        Screen::List => {
+            let mut v = vec![
+                ("↑↓", "pilih"),
+                ("Enter", "detail"),
+                ("/", "cari"),
+                ("t", "tahun"),
+                ("←→", "halaman"),
+            ];
+            if app.module == Module::Pekerjaan {
+                v.push(("n", "baru"));
+            }
+            v.extend([
+                ("s", "kirim antrean"),
+                ("x", "buang ditolak"),
+                ("Esc", "menu"),
+            ]);
+            v
+        }
+        Screen::Detail => {
+            let mut v = vec![("Esc", "kembali")];
+            match app.module {
+                Module::Kontrak => v.push(("n", "register baru")),
+                _ => v.push(("e", "ubah")),
+            }
+            v
+        }
+        Screen::Form if app.form.as_ref().is_some_and(|f| f.pemilih.is_some()) => {
+            vec![("↑↓", "pilih"), ("Enter", "pakai"), ("Esc", "batal")]
+        }
+        Screen::Form => vec![
+            ("Tab/↑↓", "pindah"),
+            ("Enter", "pilih"),
+            ("Spasi", "centang"),
+            ("Ctrl+S", "simpan"),
+            ("Esc", "batal"),
+        ],
     }
+}
+
+fn draw_help(frame: &mut Frame, pairs: &[(&str, &str)], area: Rect) {
+    let mut spans = vec![Span::raw(" ")];
+    for (tombol, ket) in pairs {
+        spans.push(Span::styled(
+            format!(" {tombol} "),
+            Style::default()
+                .fg(Color::White)
+                .bg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {ket}   "),
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Status bar dengan ikon dan warna sesuai jenis pesan.
+fn draw_status(frame: &mut Frame, pesan: &str, area: Rect) {
+    let (ikon, warna) =
+        if pesan.contains("Gagal") || pesan.contains("gagal") || pesan.contains("Periksa") {
+            ("✖", ERR)
+        } else if pesan.contains("Offline")
+            || pesan.contains("Tidak ada koneksi")
+            || pesan.contains("cache")
+            || pesan.contains("antrean")
+            || pesan.contains("Tidak ada perubahan")
+            || pesan.contains("Sesi habis")
+        {
+            ("⚠", WARN)
+        } else if pesan.contains("Tersimpan")
+            || pesan.contains("terkirim")
+            || pesan.contains("Masuk sebagai")
+            || pesan.contains("sudah keluar")
+        {
+            ("✔", OK)
+        } else {
+            ("ℹ", MUTED)
+        };
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {ikon} "),
+            Style::default().fg(warna).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(pesan.to_string(), Style::default().fg(Color::Gray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn panel(judul: &str) -> Block<'_> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_SOFT))
+        .title(Span::styled(
+            format!(" {judul} "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn sorot() -> Style {
+    Style::default()
+        .bg(SELECT_BG)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
+    let kotak = centered(area, 56, 13);
     let masked = "•".repeat(app.password.chars().count());
-    let field = |label: &str, value: &str, active: bool| {
-        let style = if active {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    let field = |label: &str, value: String, active: bool| {
+        let (marker, gaya) = if active {
+            (
+                "▌ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Style::default()
+            ("  ", Style::default().fg(MUTED))
         };
-        Line::from(vec![Span::styled(format!("{label:<10}"), style), Span::raw(value.to_string())])
+        let kursor = if active { "▏" } else { "" };
+        Line::from(vec![
+            Span::styled(marker, gaya),
+            Span::styled(format!("{label:<10}"), gaya),
+            Span::raw(format!("{value}{kursor}")),
+        ])
     };
     let lines = vec![
         Line::from(""),
-        field("Email", &app.email, app.login_field == 0),
+        Line::from(Span::styled(
+            "Selamat datang di Arumanis",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Masuk dengan akun Anda",
+            Style::default().fg(MUTED),
+        )),
         Line::from(""),
-        field("Password", &masked, app.login_field == 1),
+        field("Email", app.email.clone(), app.login_field == 0),
         Line::from(""),
+        field("Password", masked, app.login_field == 1),
     ];
-    let block = Block::bordered().title(" Masuk ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).block(panel("Masuk")), kotak);
 }
 
 fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let kotak = centered(area, 48, 14);
     let mut items: Vec<ListItem> = Module::ALL
         .iter()
-        .map(|m| ListItem::new(m.title()))
+        .map(|m| ListItem::new(format!("  {}", m.title())))
         .collect();
-    items.push(ListItem::new("Keluar"));
+    items.push(ListItem::new("  Keluar").style(Style::default().fg(ERR)));
+    let [daftar, info] = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(kotak);
     let list = List::new(items)
-        .block(Block::bordered().title(" Menu "))
-        .highlight_style(Style::default().bg(ACCENT).fg(Color::White))
+        .block(panel("Menu"))
+        .highlight_style(sorot())
         .highlight_symbol("▶ ");
     let mut state = ListState::default().with_selected(Some(app.menu_idx));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, daftar, &mut state);
+    let info_line = Line::from(vec![
+        Span::styled(format!(" Tahun {}", app.year), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("   Antrean {}", app.antrean.len()),
+            Style::default().fg(MUTED),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(info_line), info);
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
-    let [search_area, rows_area] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    let [cari_area, rows_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
-    let search_text = if app.searching {
-        format!("{}▏", app.search)
+    let teks_cari = if app.searching {
+        Line::from(vec![
+            Span::raw(app.search.clone()),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+        ])
     } else if app.search.is_empty() {
-        "tekan / untuk mencari".to_string()
+        Line::from(Span::styled(
+            "tekan / untuk mencari",
+            Style::default().fg(MUTED),
+        ))
     } else {
-        format!("cari: {}", app.search)
+        Line::from(vec![
+            Span::styled("cari: ", Style::default().fg(MUTED)),
+            Span::raw(app.search.clone()),
+        ])
     };
-    let title = if app.cached_at.is_some() {
-        format!(" Tahun {} · halaman {} · offline ", app.year, app.page)
-    } else {
-        format!(" Tahun {} · halaman {} ", app.year, app.page)
-    };
-    frame.render_widget(
-        Paragraph::new(search_text).block(Block::bordered().title(title)),
-        search_area,
-    );
+    let antrean = app.antrean_modul();
+    let mut judul = format!("Tahun {} · halaman {}", app.year, app.page);
+    if app.cached_at.is_some() {
+        judul.push_str(" · offline");
+    }
+    if !antrean.is_empty() {
+        judul.push_str(&format!(" · {} menunggu", antrean.len()));
+    }
+    frame.render_widget(Paragraph::new(teks_cari).block(panel(&judul)), cari_area);
 
-    let items: Vec<ListItem> = if app.rows.is_empty() {
-        vec![ListItem::new("Tidak ada data di halaman ini.")]
+    let mut items: Vec<ListItem> = antrean
+        .iter()
+        .map(|p| match &p.galat {
+            Some(g) => ListItem::new(Line::from(vec![
+                Span::styled("✖ ", Style::default().fg(ERR)),
+                Span::raw(format!("{}  ", p.label)),
+                Span::styled(format!("ditolak: {g}"), Style::default().fg(ERR)),
+            ])),
+            None => ListItem::new(Line::from(vec![
+                Span::styled("⧗ ", Style::default().fg(WARN)),
+                Span::raw(format!("{}  ", p.label)),
+                Span::styled("menunggu kirim", Style::default().fg(WARN)),
+            ])),
+        })
+        .collect();
+    let offset = items.len();
+    if app.rows.is_empty() {
+        items.push(ListItem::new(Span::styled(
+            "Tidak ada data di halaman ini.",
+            Style::default().fg(MUTED),
+        )));
     } else {
-        app.rows.iter().map(|r| ListItem::new(app.row_label(r))).collect()
-    };
+        items.extend(app.rows.iter().map(|r| ListItem::new(app.row_label(r))));
+    }
     let list = List::new(items)
-        .block(Block::bordered())
-        .highlight_style(Style::default().bg(ACCENT).fg(Color::White))
+        .block(panel("Daftar"))
+        .highlight_style(sorot())
         .highlight_symbol("▶ ");
-    let selected = if app.rows.is_empty() { None } else { Some(app.selected) };
+    let selected = if app.rows.is_empty() {
+        None
+    } else {
+        Some(offset + app.selected)
+    };
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(list, rows_area, &mut state);
 
@@ -139,14 +336,22 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// Dropdown tahun anggaran, digambar di atas daftar.
 fn draw_year_menu(frame: &mut Frame, area: Rect, idx: usize) {
     let options = crate::cache::year_options(chrono::Local::now().year());
-    let width = 16u16.min(area.width);
+    let width = 18u16.min(area.width);
     let height = (options.len() as u16 + 2).min(area.height);
-    let popup = Rect::new(area.x + area.width.saturating_sub(width), area.y, width, height);
-    let items: Vec<ListItem> = options.iter().map(|y| ListItem::new(y.to_string())).collect();
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width),
+        area.y,
+        width,
+        height,
+    );
+    let items: Vec<ListItem> = options
+        .iter()
+        .map(|y| ListItem::new(format!(" {y}")))
+        .collect();
     let list = List::new(items)
-        .block(Block::bordered().title(" Tahun "))
-        .highlight_style(Style::default().bg(ACCENT).fg(Color::White))
-        .highlight_symbol("▶ ");
+        .block(panel("Tahun"))
+        .highlight_style(sorot())
+        .highlight_symbol("▶");
     let mut state = ListState::default().with_selected(Some(idx));
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut state);
@@ -160,16 +365,232 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = detail_rows(value)
         .into_iter()
         .map(|(label, text)| {
-            let style = if label.starts_with(' ') {
-                Style::default().fg(Color::Gray)
+            if label.starts_with(' ') {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<28}", format!("   {}", label.trim())),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled(text, Style::default().fg(Color::Gray)),
+                ])
             } else {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            };
-            Line::from(vec![Span::styled(format!("{label:<28}"), style), Span::raw(text)])
+                let teks_nilai = if text == "-" {
+                    Span::styled(text, Style::default().fg(MUTED))
+                } else {
+                    Span::styled(text, Style::default().fg(Color::White))
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("{label:<28}"),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    teks_nilai,
+                ])
+            }
         })
         .collect();
     let paragraph = Paragraph::new(Text::from(lines))
-        .block(Block::bordered())
+        .block(panel("Detail"))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(form) = &app.form else {
+        return;
+    };
+    let lebar_label = 24;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, f) in form.fields.iter().enumerate() {
+        let aktif = i == form.fokus;
+        let gaya = if aktif {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let marker = if aktif { "▌ " } else { "  " };
+        let wajib = if f.wajib {
+            Span::styled(" *", Style::default().fg(ERR))
+        } else {
+            Span::raw("")
+        };
+
+        let (nilai, nilai_gaya) = match f.kind {
+            Kind::Pilih => {
+                let teks = f.label_terpilih();
+                let gaya_nilai = if f.nilai.is_empty() {
+                    Style::default().fg(MUTED)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                (
+                    format!("{teks}{}", if f.terkunci { "" } else { "  ▾" }),
+                    gaya_nilai,
+                )
+            }
+            Kind::Centang => {
+                if f.nilai == "1" {
+                    ("◉ ya".to_string(), Style::default().fg(OK))
+                } else {
+                    ("○ tidak".to_string(), Style::default().fg(MUTED))
+                }
+            }
+            _ if f.nilai.is_empty() => {
+                let kursor = if aktif && !f.terkunci { "▏" } else { "" };
+                (format!("—{kursor}"), Style::default().fg(MUTED))
+            }
+            _ => {
+                let kursor = if aktif && !f.terkunci { "▏" } else { "" };
+                (
+                    format!("{}{kursor}", f.nilai),
+                    Style::default().fg(Color::White),
+                )
+            }
+        };
+        let mut spans = vec![
+            Span::styled(marker, gaya),
+            Span::styled(format!("{:<lebar_label$}", f.label), gaya),
+            Span::styled(nilai, nilai_gaya),
+        ];
+        if f.terkunci {
+            spans.push(Span::styled(
+                "  (tidak bisa diubah)",
+                Style::default().fg(MUTED),
+            ));
+        }
+        spans.push(wajib);
+        lines.push(Line::from(spans));
+        if let Some(g) = &f.galat {
+            lines.push(Line::from(Span::styled(
+                format!("{:<w$}✖ {g}", "", w = lebar_label + 2),
+                Style::default().fg(ERR),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(panel("Isian"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+
+    if form.pemilih.is_some() {
+        draw_pemilih(frame, area, form);
+    }
+}
+
+/// Pemilih dropdown untuk isian aktif, di tengah area formulir.
+fn draw_pemilih(frame: &mut Frame, area: Rect, form: &Form) {
+    let f = form.fokus_field();
+    let Some(idx) = form.pemilih else {
+        return;
+    };
+    let width = 56u16.min(area.width.saturating_sub(4));
+    let height = (f.pilihan.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + 1,
+        width,
+        height,
+    );
+    let items: Vec<ListItem> = f
+        .pilihan
+        .iter()
+        .map(|(_, l)| ListItem::new(format!(" {l}")))
+        .collect();
+    let list = List::new(items)
+        .block(panel(f.label))
+        .highlight_style(sorot())
+        .highlight_symbol("▶");
+    let mut state = ListState::default().with_selected(Some(idx));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+/// Kotak berukuran tetap di tengah `area`, dibatasi ukuran layar.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{Client, DEFAULT_BASE};
+    use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::{backend::TestBackend, Terminal};
+    use serde_json::json;
+
+    fn teks(app: &App) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn app() -> App {
+        App::new(Client::new(DEFAULT_BASE.to_string()).unwrap())
+    }
+
+    #[test]
+    fn setiap_layar_tergambar_tanpa_panik() {
+        let mut a = app();
+        assert!(teks(&a).contains("ARUMANIS"));
+        assert!(teks(&a).contains("Masuk"));
+
+        a.screen = Screen::Menu;
+        assert!(teks(&a).contains("Antrean 0"));
+
+        a.screen = Screen::List;
+        a.rows = vec![json!({ "id": 1, "nama_paket": "Jaringan A" })];
+        assert!(teks(&a).contains("Jaringan A"));
+
+        a.screen = Screen::Detail;
+        a.detail = Some(json!({ "id": 1, "nama_paket": "Jaringan A" }));
+        assert!(teks(&a).contains("nama_paket"));
+
+        a.screen = Screen::Form;
+        a.form = Some(Form::pekerjaan(None, None, vec![], vec![], vec![], vec![]));
+        let layar = teks(&a);
+        assert!(layar.contains("Nama paket"));
+        assert!(layar.contains("Ctrl+S"));
+    }
+
+    #[test]
+    fn tampilan_menampilkan_pesan_galat_dan_pemilih() {
+        let mut a = app();
+        a.screen = Screen::Form;
+        let kegiatan = crate::form::pilihan(
+            &[json!({ "id": 4, "nama_kegiatan": "Air" })],
+            &["nama_kegiatan"],
+        );
+        a.form = Some(Form::pekerjaan(
+            None,
+            None,
+            kegiatan,
+            vec![],
+            vec![],
+            vec![],
+        ));
+        a.handle_key(KeyEvent::from(KeyCode::Down));
+        a.form.as_mut().unwrap().fokus = 4; // kegiatan
+        a.form.as_mut().unwrap().buka_pemilih();
+        assert!(teks(&a).contains("kosong"));
+    }
 }
